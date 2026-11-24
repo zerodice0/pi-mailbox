@@ -16,18 +16,30 @@
 
 | 호스트 | pi-mailbox | HAM | Herdr pi 통합 |
 |---|---|---|---|
-| Mac Studio | 설치 | 갱신 | v9 |
-| macbook-pro | 설치 | 갱신 | v9 |
-| winmini | 설치 | 갱신 | v9 |
-| rogallyx | 설치(관리 체크아웃) | 갱신 | v9 |
+| Mac Studio | `pi install` 완료 | `194be93`(GitHub 설치) | v9 |
+| macbook-pro | `pi install` 완료 | `194be93`(`ham rollout`) | v9 |
+| winmini | `pi install` 완료 | `194be93`(로컬 체크아웃) | v9 |
+| rogallyx | `pi install` 완료(관리 체크아웃) | `194be93`(로컬 체크아웃) | v9 |
 | winmax2 | 미설치(오프라인) | 미갱신 | 미확인 |
 
-실행 중인 pi 세션은 `/reload`를 실행하거나 다시 시작해야 확장이 적용됩니다. 사용자가 고른 세션만 다시 시작합니다.
+- 모든 갱신 호스트의 HAM ledger는 schema 13입니다. HAM skill 사본도 갱신했습니다.
+- GitHub 설치는 갱신할 때마다 plugin root 경로가 바뀝니다. 그래서 rogallyx와 winmini의 peer 등록(`ledger peer add --ssh-alias s-mac-studio|macbook-pro`)을 다시 했습니다. HAM을 다시 갱신할 때도 같은 작업이 필요합니다.
+- 실행 중이던 pi 세션은 `/reload`를 실행하거나 다시 시작해야 확장이 적용됩니다. 사용자가 고른 세션만 다시 시작합니다.
+
+## 실제 환경 검증 (Mac Studio, HAM 백엔드)
+
+Herdr에 일회용 pi 세션을 띄우고 사용자 자격으로 메일을 보내 확인했습니다.
+
+- **수신기 등록:** 세션이 `client=pi`, `extension_present=1`로 등록되었습니다.
+- **idle 자동 처리:** idle 상태의 세션이 action 메일을 자동으로 처리했습니다. 기록은 `via=wake`, `delivered`이고, 근거는 `pi:accepted-journal:…`입니다.
+- **cancel:** 실행 중이던 `sleep 90`이 `Command aborted`로 중단되었습니다. 이어서 cancel이 `via=urgent`로 주입되었고 보고 턴이 시작되었습니다.
+- **발견한 문제:** 사용자(`user@HOST`)에게는 메일 주소가 없어서, 에이전트가 메일로 보고할 수 없었습니다. HAM `194be93`과 local 백엔드 모두, 사용자에게 보내는 보고는 응답으로 하도록 지침을 고쳤습니다.
+- **미검증 항목:** amend의 steer와 local 백엔드는 실제 모델로 아직 검증하지 않았습니다(단위 테스트와 e2e 테스트만 있습니다).
 
 ## 남은 작업
 
 1. **winmax2:** 온라인이 되면 HAM을 갱신하고(같은 commit), pi-mailbox를 설치합니다. 그 전까지 winmax2는 긴급 메시지(`urgency`가 있는 payload)를 `invalid_message`로 거부합니다.
-2. **실제 세션 검증:** 실제 모델로 idle 처리, amend의 steer, cancel의 abort와 보고 턴을 검증합니다. Linux(rogallyx)와 macOS에서 모두 확인합니다.
+2. **실제 세션 검증:** amend의 steer와 local 백엔드를 실제 모델로 검증합니다. Linux(rogallyx)에서도 확인합니다.
 3. **local 백엔드 운영 확인:** 여러 세션이 동시에 쓸 때의 잠금 대기 시간과 `fs.watch` 동작을 확인합니다.
 
 ## 지켜야 할 계약

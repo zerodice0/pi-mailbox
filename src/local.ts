@@ -90,8 +90,9 @@ export function renderBundle(messages: readonly StoredMessage[], marker: string)
   if (urgencies.has("amend")) prefix += "AMEND: the sender supplements the referenced message; apply it to that work.\n";
   if (urgencies.has("cancel"))
     prefix += "CANCEL: the sender cancelled the referenced message. Stop that work; do not continue it and do not revert " +
-      "anything yourself. Report what was already done (files, commands, side effects) with mailbox_send reply_to=<the " +
-      "cancel message ID>, kind action, so the sender can decide whether to revert.\n";
+      "anything yourself. Report what was already done (files, commands, side effects) so the sender can decide whether " +
+      "to revert: to an agent sender with mailbox_send reply_to=<the cancel message ID>, kind action; to a user@HOST " +
+      "sender in your response.\n";
   const headers = messages.map(message => {
     const label = message.urgency ? `${message.kind} · ${message.urgency} of ${message.reply_to}` : message.kind;
     return `\n--- ${message.message_id} ${marker} ---\nFrom ${message.sender_label} [${label}]\n` +
@@ -130,7 +131,9 @@ function fitRows(rows: StoredMessage[], trigger?: string): StoredMessage[] {
   }
   return [];
 }
-const order = (a: StoredMessage, b: StoredMessage) => a.created_at - b.created_at || a.message_id.localeCompare(b.message_id);
+/** Oldest first; on a timestamp tie an original precedes its own reply/amend/cancel. */
+const order = (a: StoredMessage, b: StoredMessage) => a.created_at - b.created_at ||
+  (a.reply_to === b.message_id ? 1 : b.reply_to === a.message_id ? -1 : 0) || a.message_id.localeCompare(b.message_id);
 
 export interface LocalOptions {
   root?: string; host?: string; pid?: number; now?: () => number; alive?: (pid: number) => boolean;
