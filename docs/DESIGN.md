@@ -1,0 +1,62 @@
+# pi-mailbox 설계
+
+## 1. 목표
+
+- pi 세션에 도착한 메일은 메일함에 쌓아 두고, 세션이 idle 상태가 되면 큐처럼 처리합니다.
+- 긴급 메시지를 두 단계로 나눕니다. amend(보강)는 steer로 처리하고, cancel(취소)은 abort한 뒤 송신자에게 보고하게 합니다.
+- 외부에서 pi에 프롬프트를 입력하거나 턴을 시작하지 않습니다. 처리 시점은 세션 안의 확장이 결정합니다.
+- HAM이 있으면 HAM을 중앙 관제로 쓰고, HAM이 없어도 같은 동작을 제공합니다.
+
+## 2. 구성
+
+| 파일 | 역할 |
+|---|---|
+| `src/core.ts` | `PiMailbox`: idle, 초안, 입력 정지 판정, 긴급 처리(steer/abort), 주입, 세션 기록 기반 ACK, 상태 표시줄, overlay |
+| `src/types.ts` | 수신기 프로토콜 타입(HAM `ledger runtime` protocol 1과 같음) |
+| `src/ham.ts` | HAM 백엔드: `python3 -m ham cli ledger runtime ...` 호출과 응답 검증 |
+| `src/local.ts` | local 백엔드: 같은 프로토콜을 구현하는 파일 메일함, 송신(`send`, `urgent`, `handle`, `recover`) |
+| `index.ts` | 백엔드 선택, pi 이벤트 연결, `/mail`, `alt+m`, local 전용 `mailbox_*` 도구 |
+
+`PiMailbox`는 백엔드와 다섯 가지 동작(`register`, `inspect`, `claim`, `applied`, `release`)으로만 통신합니다. 따라서 두 백엔드에서 큐 처리 동작이 같습니다.
+
+## 3. 백엔드 선택
+
+`PI_MAILBOX_BACKEND`의 기본값은 `auto`입니다. Herdr 환경 변수가 있고 HAM 플러그인 root를 찾을 수 있으면 `ham`을, 그렇지 않으면 `local`을 고릅니다. 선택은 확장을 불러올 때 한 번 하며, 이후 세션 도중에 바꾸지 않습니다. 중간에 바꾸면 메일 원본이 두 곳으로 나뉘기 때문입니다.
+
+pi-subagents의 자식 프로세스(`PI_SUBAGENT_CHILD`)에서는 아무것도 등록하지 않습니다. 메일 수신은 TUI 모드의 세션에서만 합니다.
+
+## 4. 처리 규칙
+
+- **일반 메일:**
+  - pi가 idle 상태이고, pi 내부 큐가 비어 있고, 확장 대화상자가 닫혀 있어야 합니다.
+  - editor가 비어 있고, `idle_minutes` 동안 입력이 없어야 합니다.
+  - 백엔드의 wake 조건(역할, coalesce, 시간당 횟수, hop)을 통과해야 합니다.
+  - 조건을 모두 만족하면 묶음 하나를 `followUp`과 `triggerTurn`으로 주입합니다.
+  - 사용자가 프롬프트를 제출할 때도 대기 중인 메일을 함께 붙입니다(`before_agent_start`).
+- **cancel:** 현재 run이 원본 thread를 처리하고 있으면, editor에 초안이 있어도 `ctx.abort()`를 호출합니다. 초안은 지우지 않고 그대로 둡니다. 현재 run이 처리 중인 thread는 이 확장이 그 run에 주입한 메일의 thread로 판단합니다. `agent_settled` 이후 cancel을 claim하고, 보고 턴을 시작합니다. 다른 작업 중에 도착한 cancel은 idle 상태에서 가장 먼저 처리합니다.
+- **amend:** 현재 run이 원본 thread를 처리하고 있고 editor가 비어 있으면, 그 amend만 claim해서 `steer`로 주입합니다. 그 밖의 경우에는 editor가 비어 있는 idle 상태에서 가장 먼저 처리합니다.
+- **긴급 claim:** turn state, coalesce, 시간당 횟수는 건너뛰고 hop 제한은 지킵니다. 원본이 아직 대기 중이면 원본도 함께 claim합니다.
+- **ACK:** 세션 기록에서 `ham_mailbox` custom message의 marker, details, sha256이 정확히 일치하는 항목을 찾았을 때만 `applied`를 보고합니다. idle 상태가 되었는데도 기록에 없고 pi 큐에도 없으면, 3초가 지난 뒤 `not_applied`로 되돌립니다. 그 밖의 불확실한 경우는 `unknown`으로 남기고, 다시 주입하지 않습니다.
+
+## 5. local 백엔드 저장 구조
+
+| 경로(`~/.pi/agent/mailbox/` 아래) | 내용 |
+|---|---|
+| `agents/<agent_id>.json` | pi 세션 ID를 agent ID로 씁니다. alias(세션 이름 또는 cwd 이름), pid, generation을 기록합니다. |
+| `messages/<message_id>.json` | 변하지 않는 내용과 전달 상태(queued, delivering, delivered, handled, withdrawn) |
+| `claims/<claim_id>.json` | marker, hash, 포함된 메시지 목록 |
+| `bell/<agent_id>` | 새 메일 알림(턴을 시작하지 않음) |
+| `lock/` | 모든 변경을 직렬화하는 mkdir 잠금. 소유 프로세스가 죽었거나 15초가 지난 잠금은 회수합니다. |
+
+모든 쓰기는 임시 파일에 쓴 뒤 rename합니다. 종료 상태의 메시지와 claim은 30일 뒤 지웁니다.
+
+## 6. 권한
+
+- **HAM 백엔드:** HAM 규칙을 따릅니다. 사용자와 main 에이전트만 보낼 수 있고, 자신이 보낸 메일만 대상으로 할 수 있습니다.
+- **local 백엔드:** 역할이 없습니다. 사용자(`/mail`)와 에이전트 모두 자신이 보낸 메일만 amend하거나 cancel할 수 있습니다. 사용자가 보낸 메일은 같은 호스트의 어느 세션에서든 `/mail`로 고칠 수 있습니다.
+
+## 7. 범위에서 제외한 항목
+
+- local 백엔드의 호스트 간 전송(호스트 간 전송이 필요하면 HAM을 씁니다)
+- HAM 백엔드 세션과 local 백엔드 세션 사이의 메일 교환
+- 세션 이름 동기화

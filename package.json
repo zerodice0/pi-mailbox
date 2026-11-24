@@ -1,0 +1,11 @@
+{
+  "name": "pi-mailbox",
+  "version": "0.1.0",
+  "description": "Queued, idle-time mailbox for pi sessions with urgent amend/cancel; works standalone or with HAM.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "test": "bun test ./tests" },
+  "pi": { "extensions": ["./index.ts"] }
+}
