@@ -16,12 +16,13 @@
 
 | 호스트 | pi-mailbox | HAM | Herdr pi 통합 |
 |---|---|---|---|
-| Mac Studio | `pi install` 완료 | `194be93`(GitHub 설치) | v9 |
-| macbook-pro | `pi install` 완료 | `194be93`(`ham rollout`) | v9 |
-| winmini | `pi install` 완료 | `194be93`(로컬 체크아웃) | v9 |
-| rogallyx | `pi install` 완료(관리 체크아웃) | `194be93`(로컬 체크아웃) | v9 |
+| Mac Studio | `e408c47`(`git pull`, 테스트 통과) | `194be93`(GitHub 설치) | v9 |
+| macbook-pro | `e408c47`(`git pull`, 테스트 통과) | `194be93`(`ham rollout`) | v9 |
+| winmini | `e408c47`(`git pull`, 테스트 통과) | `194be93`(로컬 체크아웃) | v9 |
+| rogallyx | `e408c47`(관리 체크아웃) | `194be93`(로컬 체크아웃) | v9 |
 | winmax2 | 미설치(오프라인) | 미갱신 | 미확인 |
 
+- pi-mailbox 표의 commit은 각 호스트 체크아웃의 `HEAD`입니다. 관리 체크아웃에서 push한 뒤 다른 호스트에서 `git pull --ff-only`로 맞춥니다.
 - 모든 갱신 호스트의 HAM ledger는 schema 13입니다. HAM skill 사본도 갱신했습니다.
 - GitHub 설치는 갱신할 때마다 plugin root 경로가 바뀝니다. 그래서 rogallyx와 winmini의 peer 등록(`ledger peer add --ssh-alias s-mac-studio|macbook-pro`)을 다시 했습니다. HAM을 다시 갱신할 때도 같은 작업이 필요합니다.
 - 실행 중이던 pi 세션은 `/reload`를 실행하거나 다시 시작해야 확장이 적용됩니다. 사용자가 고른 세션만 다시 시작합니다.
