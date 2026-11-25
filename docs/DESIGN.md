@@ -12,7 +12,9 @@
 | 파일 | 역할 |
 |---|---|
 | `src/core.ts` | `PiMailbox`: idle, 초안, 입력 정지 판정, 긴급 처리(steer/abort), 주입, 세션 기록 기반 ACK, 상태 표시줄 |
-| `src/board.ts` | 메일함 보드 overlay: 실시간 상태 표시, 선택, 마우스 끌기와 `shift+방향키`로 위치 이동(보기 전용) |
+| `src/board.ts` | 메일함 패널: 입력을 가로채지 않는 overlay, 실시간 상태 표시, 마우스 선택과 끌기(보기 전용) |
+| `src/card.ts` | 전달된 묶음(`ham_mailbox`)을 대화 기록에 카드로 그리는 renderer |
+| `src/palette.ts` | quota/pi-team 패널과 같은 titanium 팔레트와 틀 그리기 도구 |
 | `src/types.ts` | 수신기 프로토콜 타입(HAM `ledger runtime` protocol 1과 같음) |
 | `src/ham.ts` | HAM 백엔드: `python3 -m ham cli ledger runtime ...` 호출과 응답 검증 |
 | `src/local.ts` | local 백엔드: 같은 프로토콜을 구현하는 파일 메일함, 송신(`send`, `urgent`, `handle`, `recover`) |
@@ -39,12 +41,16 @@ pi-subagents의 자식 프로세스(`PI_SUBAGENT_CHILD`)에서는 아무것도 �
 - **긴급 claim:** turn state, coalesce, 시간당 횟수는 건너뛰고 hop 제한은 지킵니다. 원본이 아직 대기 중이면 원본도 함께 claim합니다.
 - **ACK:** 세션 기록에서 `ham_mailbox` custom message의 marker, details, sha256이 정확히 일치하는 항목을 찾았을 때만 `applied`를 보고합니다. idle 상태가 되었는데도 기록에 없고 pi 큐에도 없으면, 3초가 지난 뒤 `not_applied`로 되돌립니다. 그 밖의 불확실한 경우는 `unknown`으로 남기고, 다시 주입하지 않습니다.
 
-## 4-1. 메일함 보드
+## 4-1. 메일함 패널과 메일 카드
 
-- `/mail`, `alt+m`, `ctrl+shift+m`으로 열고 닫습니다. 같은 키를 다시 누르면 닫힙니다.
-- 보드는 렌더링할 때마다 `PiMailbox.state`를 읽습니다. 상태가 바뀌면(`render`) 보드도 다시 그립니다. 열 때 `inspect`를 한 번 비동기로 호출합니다.
-- 위치는 세션마다 하나인 overlay 옵션 객체(`placement`)에 둡니다. pi-tui는 이 객체의 `row`/`col`을 렌더링마다 읽고 터미널 안으로 제한합니다. 제목 줄을 끌면(fullscreen 모드의 마우스 capture) 또는 `shift+방향키`를 누르면 이 값을 바꿉니다. 끌기를 마치면 실제로 그려진 위치로 값을 맞춥니다.
-- 보드는 보기 전용입니다. 열거나 고르는 것만으로 ACK하지 않습니다.
+- **패널:** `/mail`, `alt+m`, `ctrl+shift+m`으로 열고 닫습니다(`/mail board on|off|reset`).
+  - 사용 한도(quota) 패널, pi-team 패널과 같은 titanium 팔레트, 틀, 폭(50칸)을 씁니다. 세 패널이 화면 오른쪽에 한 줄로 쌓이도록, 메일함은 오른쪽 아래 editor 위(`bottom-right`, 아래 6줄 비움)에 둡니다.
+  - `nonCapturing` overlay이므로 열려 있어도 editor 입력을 가로채지 않습니다.
+  - 렌더링할 때마다 `PiMailbox.state`를 읽고, 상태가 바뀌면 다시 그립니다. 열 때 `inspect`를 한 번 비동기로 호출하고, 경과 시간을 갱신하려고 30초마다 다시 그립니다. 수신기가 실패하는 동안에는 오래된 목록 대신 오류를 보여 줍니다.
+  - 목록은 처리 순서(cancel, amend, action, FYI, 같은 종류 안에서는 오래된 순)로 정렬합니다. 고른 메일의 상세를 아래에 보여 줍니다.
+  - 위치는 anchor 기준의 offset이며 `board.json`(local 메일함 root)에 저장합니다. 제목 줄 끌기는 fullscreen 모드의 마우스 capture로 처리합니다.
+  - 보기 전용입니다. 열거나 고르는 것만으로 ACK하지 않습니다.
+- **카드:** `pi.registerMessageRenderer("ham_mailbox")`로 전달된 묶음을 카드로 그립니다. 에이전트가 받는 content는 바꾸지 않으므로 ACK(marker와 sha256 비교)에 영향이 없습니다. 카드에는 처리 지침과 marker를 숨기고 종류, 송신자, 본문만 보여 줍니다. 펼치면(`app.tools.expand`) 전체 content를 보여 줍니다. HAM과 local 묶음 형식을 모두 해석하며, 해석할 수 없으면 pi 기본 표시로 돌아갑니다.
 
 ## 5. local 백엔드 저장 구조
 

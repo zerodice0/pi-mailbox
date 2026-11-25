@@ -45,7 +45,8 @@ pi install ~/workspace/development/pi-mailbox
 
 | 명령 | 설명 |
 |---|---|
-| `/mail`, `alt+m`, `ctrl+shift+m` | 이 세션의 메일함 보드를 열거나 닫습니다. 보기만 하며 처리로 기록하지 않습니다. |
+| `/mail`, `alt+m`, `ctrl+shift+m` | 이 세션의 메일함 패널을 열거나 닫습니다. 보기만 하며 처리로 기록하지 않습니다. |
+| `/mail board [on\|off\|reset]` | 패널을 켜거나 끕니다. `reset`은 패널을 editor 위의 원래 자리로 되돌립니다. |
 | `/mail agents` | 메일을 보낼 수 있는 pi 세션을 보여 줍니다. |
 | `/mail send <대상> [--fyi] <내용>` | 사용자로서 메일을 보냅니다. |
 | `/mail reply <ID> <내용>` | 받은 메일에 답장합니다. |
@@ -54,12 +55,15 @@ pi install ~/workspace/development/pi-mailbox
 | `/mail cancel <ID> [사유]` | 자신이 보낸 메일을 취소합니다. |
 | `/mail recover <ID> applied\|requeue` | 전달 여부가 불확실한 메일을 정리합니다. |
 
-메일함 보드는 열려 있는 동안 새 메일과 상태 변화를 바로 반영합니다.
+메일함 패널은 사용 한도(quota) 패널, pi-team 패널과 같은 테마와 틀을 씁니다. 폭은 50칸이고, 오른쪽 아래 editor 바로 위에 뜹니다.
 
-- `↑`/`↓`, 마우스 클릭, 휠로 메일을 고릅니다. `Esc`, `q`, 또는 같은 단축키로 닫습니다.
-- 제목 줄을 마우스로 끌거나 `shift+방향키`를 누르면 보드를 옮길 수 있습니다. 옮긴 위치는 그 세션이 끝날 때까지 유지됩니다.
-- 마우스 조작은 pi의 fullscreen 모드(`tuiMode`의 기본값)에서만 동작합니다. regular 모드에서는 `shift+방향키`를 씁니다.
+- 패널이 떠 있어도 입력은 그대로 할 수 있습니다. 열려 있는 동안 새 메일과 상태 변화를 바로 반영합니다.
+- 목록은 세션이 처리할 순서(cancel, amend, action, FYI)대로 보여 줍니다. 아래쪽에는 고른 메일의 송신자와 본문 앞부분을 보여 줍니다.
+- 마우스로 메일을 클릭하거나 휠을 굴리면 다른 메일을 고를 수 있습니다. 제목 줄을 끌면 패널을 옮길 수 있고, 옮긴 위치는 `~/.pi/agent/mailbox/board.json`에 저장됩니다.
+- 마우스 조작은 pi의 fullscreen 모드(`tuiMode`의 기본값)에서만 동작합니다.
 - `ctrl+shift+m`은 수정 키를 구분해서 보내는 터미널(kitty keyboard protocol 또는 modifyOtherKeys)에서만 동작합니다. Linux에서는 입력기(fcitx5, IBus)가 이 조합을 가로챌 수도 있습니다. 이런 환경에서는 `alt+m`을 씁니다.
+
+메일이 세션에 전달되면 대화 기록에는 `✉ mail` 카드가 표시됩니다. 카드에는 종류, 송신자, 본문만 보이고, 에이전트용 처리 지침과 전송 표지는 숨깁니다. `ctrl+o`(도구 출력 펼치기)를 누르면 에이전트가 받은 전체 텍스트를 볼 수 있습니다.
 
 `<ID>`에는 목록에 보이는 앞 8자리처럼, 6자 이상의 접두어를 써도 됩니다. `/mail send`, `/mail reply`, `/mail amend`, `/mail cancel`, `/mail recover`는 local 백엔드에서만 동작하며, HAM 백엔드에서는 HAM Mailbox를 씁니다.
 

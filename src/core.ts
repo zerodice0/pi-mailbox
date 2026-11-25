@@ -20,7 +20,9 @@ import { createHash } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { MailboxBoard, boardPlacement, type BoardSnapshot } from "./board.ts";
+import { MailboxBoard, boardOptions, loadPosition, savePosition, type BoardSnapshot } from "./board.ts";
+import { defaultRoot } from "./local.ts";
+import type { OverlayOptions } from "@earendil-works/pi-tui";
 import { ReceiverError, type Call, type ClaimBundle, type Inspection, type NativeAgent, type NativeClaim,
   type NativeMessage, type Operation, type ReceiverReplies, type Registration, type Request, type Thresholds,
   type Urgency } from "./types.ts";
@@ -122,8 +124,9 @@ export class PiMailbox {
   private registrationFailures = 0;
   state?: Inspection;
   registration?: Registration;
-  /** Board overlay position for this session (shared with pi-tui overlay options). */
-  readonly placement = boardPlacement();
+  /** Side panel overlay options, shared with pi-tui, which reads the drag offsets on every render. */
+  private boardOptions?: OverlayOptions;
+  private lastError?: string;
   private board?: { close: () => void; rerender: () => void };
 
   private call: Call;
@@ -154,6 +157,8 @@ export class PiMailbox {
     const key = JSON.stringify([code, error instanceof ReceiverError ? error.phase : phase]);
     const now = Date.now(), previous = this.errors.get(key);
     ctx.ui.setStatus(STATUS_KEY, this.label + ": receiver unavailable");
+    this.lastError = diagnosticText(textValue, 240);
+    this.board?.rerender();
     if (previous === undefined || now - previous >= 600000) {
       ctx.ui.notify(diagnosticText(textValue, 1200), "warning");
       this.errors.set(key, now);
@@ -512,19 +517,31 @@ export class PiMailbox {
   // ---- view-only mailbox board ---------------------------------------------------------------
   snapshot(): BoardSnapshot {
     return {
-      title: (this.backend.name === "ham" ? "HAM" : "Local") + " mailbox",
-      summary: statusText(this.state, this.pending.size, this.label) ?? "empty",
+      backend: this.backend.name,
       items: this.state?.inbox ?? [],
       urgent: new Set((this.state?.urgent ?? []).map(item => item.message_id)),
+      processing: [...this.pending.values()].some(pending => pending.phase !== "unknown"),
+      error: this.errors.size ? this.lastError : undefined,
     };
   }
-  /** Toggle the board overlay (alt+m, ctrl+shift+m, /mail). It reads live state and never ACKs. */
-  async showMailbox(ctx: ExtensionContext): Promise<void> {
+  /**
+   * Show, hide or toggle the side panel (alt+m, ctrl+shift+m, /mail). It is non-capturing, reads
+   * live state and never ACKs. `reset` moves it back to its default place above the editor.
+   */
+  async showMailbox(ctx: ExtensionContext, action: "toggle" | "on" | "off" | "reset" = "toggle"): Promise<void> {
     if (ctx.mode !== "tui") { ctx.ui.notify("The mailbox needs interactive mode.", "error"); return; }
-    if (this.board) { this.board.close(); return; }
-    const { truncateToWidth, visibleWidth, wrapTextWithAnsi, matchesKey } = await import("@earendil-works/pi-tui");
+    const root = defaultRoot(this.environment);
+    if (action === "reset") {
+      Object.assign(this.boardOptions ??= boardOptions(loadPosition(root)), boardOptions());
+      savePosition(root, { offsetX: this.boardOptions.offsetX ?? 0, offsetY: this.boardOptions.offsetY ?? 0 });
+      if (this.board) { this.board.rerender(); return; }
+      action = "on";
+    }
+    if (this.board) { if (action !== "on") this.board.close(); return; }
+    if (action === "off") return;
+    const { visibleWidth } = await import("@earendil-works/pi-tui");
     if (this.board) return;
-    let handle: { getBounds(): { row: number; col: number; width: number; height: number } | undefined } | undefined;
+    const options = this.boardOptions ??= boardOptions(loadPosition(root));
     const board: { close: () => void; rerender: () => void } = { close: () => undefined, rerender: () => undefined };
     this.board = board;
     // Refresh in the background; the board re-renders when the state arrives.
@@ -534,15 +551,18 @@ export class PiMailbox {
       try { this.state = await this.receiver("inspect", identity(registration.agent), ctx); this.render(ctx); }
       catch (error) { this.report(ctx, error, "inspect"); }
     })();
+    // Ages ("3m") move on even when nothing else changes.
+    const tick = this.timers.setInterval(() => board.rerender(), 30000);
     try {
-      await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+      await ctx.ui.custom<void>((tui, _theme, _keybindings, done) => {
         board.close = () => done();
         board.rerender = () => tui.requestRender();
-        return new MailboxBoard({ snapshot: () => this.snapshot(), placement: this.placement, bounds: () => handle?.getBounds(),
-          theme, keybindings, deps: { truncateToWidth, visibleWidth, wrapTextWithAnsi, matchesKey },
-          requestRender: () => tui.requestRender(), close: () => done() });
-      }, { overlay: true, overlayOptions: this.placement, onHandle: value => { handle = value; } });
+        return new MailboxBoard({ snapshot: () => this.snapshot(), overlay: options, measure: visibleWidth,
+          terminal: () => ({ columns: tui.terminal.columns, rows: tui.terminal.rows }),
+          requestRender: () => tui.requestRender(), moved: position => savePosition(root, position) });
+      }, { overlay: true, overlayOptions: options });
     } finally {
+      this.timers.clearInterval(tick);
       if (this.board === board) this.board = undefined;
     }
   }

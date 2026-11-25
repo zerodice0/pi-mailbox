@@ -1,160 +1,208 @@
 /**
- * View-only mailbox board: a bordered overlay that reads the live mailbox state on every
- * render, so it updates while open. Opening, scrolling or selecting never acknowledges mail.
+ * Mailbox side panel: a non-capturing overlay in the quota/pi-team frame and palette, so the
+ * user keeps typing while it is open. It reads the live mailbox state on every render and is
+ * view-only: opening it, selecting or scrolling never acknowledges mail.
  *
- * Moving: drag the title row with the mouse (pi fullscreen mode routes mouse events to
- * overlays), or use shift+arrows. The placement object is shared with the overlay options
- * (pi-tui reads row/col on every render and clamps them to the terminal), so the position
- * survives closing and reopening within the session.
+ * It sits at the bottom right, above the editor, and grows upward. In fullscreen mode the
+ * title row is a drag handle; clicks and the wheel choose which message the detail shows.
+ * The position is an offset from that anchor, so it survives terminal resizes and restarts.
  */
-import type { Component, OverlayBounds, OverlayOptions, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import type { OverlayOptions, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { clip, fg, oneLine, row, rule, titleRule, wrap, type Line, type Measure, type Segment, type Tone } from "./palette.ts";
 import type { InboxItem } from "./types.ts";
 
 export const BOARD_KEYS = ["alt+m", "ctrl+shift+m"] as const;
+export const WIDTH = 50;
+/** Rows kept free at the bottom for the editor and footer. */
+export const BOTTOM = 6;
+const RIGHT = 1;
+const LIST_ROWS = 6;
+const BODY_ROWS = 3;
 
-/** pi-tui helpers, injected so the board stays testable without a terminal. */
-export interface BoardDeps {
-  truncateToWidth(text: string, width: number, ellipsis?: string, pad?: boolean): string;
-  visibleWidth(text: string): number;
-  wrapTextWithAnsi(text: string, width: number): string[];
-  matchesKey(data: string, key: string): boolean;
+export interface BoardSnapshot {
+  backend: "ham" | "local";
+  items: InboxItem[];
+  urgent: ReadonlySet<string>;
+  /** A claimed bundle is on its way into this session. */
+  processing: boolean;
+  /** The receiver is failing; the board says so instead of showing stale mail as current. */
+  error?: string;
 }
-export interface BoardTheme {
-  fg(color: string, text: string): string;
-  bold(text: string): string;
-}
-export interface BoardKeybindings { matches(data: string, binding: string): boolean }
-export interface BoardSnapshot { title: string; summary: string; items: InboxItem[]; urgent: ReadonlySet<string> }
+export interface Position { offsetX: number; offsetY: number }
 
-/** Overlay options owned by the mailbox for the whole session; row/col appear once the board is moved. */
-export function boardPlacement(): OverlayOptions {
-  return { anchor: "top-right", width: "60%", minWidth: 40, maxHeight: "80%", margin: 1 };
+export function boardOptions(saved?: Position): OverlayOptions {
+  return {
+    anchor: "bottom-right", width: WIDTH, nonCapturing: true,
+    offsetX: saved?.offsetX ?? -RIGHT, offsetY: saved?.offsetY ?? -BOTTOM,
+    visible: (columns, rows) => columns >= WIDTH + 40 && rows >= BOTTOM + 10,
+  };
 }
 
-const LIST_ROWS = 8;
-const DETAIL_ROWS = 6;
+const positionFile = (root: string) => path.join(root, "board.json");
+export function loadPosition(root: string): Position | undefined {
+  try {
+    const value = JSON.parse(readFileSync(positionFile(root), "utf8")) as Partial<Position>;
+    return Number.isInteger(value.offsetX) && Number.isInteger(value.offsetY) ? value as Position : undefined;
+  } catch { return undefined; }
+}
+export function savePosition(root: string, position: Position): void {
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const temporary = `${positionFile(root)}.${process.pid}.tmp`;
+    writeFileSync(temporary, JSON.stringify(position), { mode: 0o600 });
+    renameSync(temporary, positionFile(root));
+  } catch { /* the position is a convenience */ }
+}
 
-export class MailboxBoard implements Component {
-  private selected = 0;
-  private drag?: { dx: number; dy: number };
-  /** Screen rows of the list items from the last render, relative to the board top. */
-  private listTop = 0;
-  private listStart = 0;
+const rank = (item: InboxItem) => item.urgency === "cancel" ? 0 : item.urgency === "amend" ? 1 : item.kind === "action" ? 2 : 3;
+/** Queue order as the session will meet it: cancel, amend, action, then FYI; oldest first within each. */
+export const ordered = (items: readonly InboxItem[]) => [...items].sort((a, b) => rank(a) - rank(b) || a.created_at - b.created_at);
+
+function badge(item: InboxItem): [mark: string, tone: Tone, word: string] {
+  if (item.state === "delivering") return ["◌", "label", "sending"];
+  if (item.urgency === "cancel") return ["✗", "crit", "cancel"];
+  if (item.urgency === "amend") return ["◆", "warn", "amend"];
+  return item.kind === "action" ? ["●", "ok", "action"] : ["○", "label", item.kind];
+}
+/** `host/label` and `user@host` read as the label or `user`; the full address stays in the detail. */
+export const who = (sender: string) => {
+  const label = sender.split("/").pop() || sender;
+  return label.startsWith("user@") ? "user" : label;
+};
+export function age(seconds: number, now: number): string {
+  const elapsed = Math.max(0, now / 1000 - seconds);
+  if (elapsed < 60) return "now";
+  if (elapsed < 3600) return `${Math.floor(elapsed / 60)}m`;
+  if (elapsed < 86400) return `${Math.floor(elapsed / 3600)}h`;
+  return `${Math.floor(elapsed / 86400)}d`;
+}
+
+const SENDER = 13;
+const fit = (text: string, width: number, measure: Measure) => {
+  const part = clip(text, width, measure);
+  return part + " ".repeat(Math.max(0, width - measure(part)));
+};
+export function boardLines(snapshot: BoardSnapshot, selectedId: string | undefined, inner: number, measure: Measure,
+                           now = Date.now()): { lines: (Line | "rule")[]; list: string[]; listStart: number; selected?: string } {
+  if (snapshot.error) return { lines: [{ left: [["Mailbox unavailable", "crit", true]] }, { left: [[oneLine(snapshot.error), "label"]] }], list: [], listStart: 0 };
+  const items = ordered(snapshot.items);
+  if (!items.length) return {
+    lines: [
+      { left: [["No mail waiting", "name", true]] },
+      { left: [["Mail is handled when this session is idle", "label"]] },
+      { left: [["Drag this title to move · alt+m to hide", "label"]] },
+    ], list: [], listStart: 0,
+  };
+  const index = Math.max(0, items.findIndex(item => item.message_id === selectedId));
+  const current = items[index];
+  const start = Math.max(0, Math.min(index - Math.floor(LIST_ROWS / 2), items.length - LIST_ROWS));
+  const shown = items.slice(start, start + LIST_ROWS);
+  const lines: (Line | "rule")[] = shown.map(item => {
+    const [mark, tone, word] = badge(item);
+    const chosen = item === current;
+    const urgent = item.urgency !== null || snapshot.urgent.has(item.message_id);
+    return {
+      left: [[chosen ? "›" : " ", "ok"], [" "], [mark, tone], [" "], [word.padEnd(6), urgent ? tone : "label"], [" "],
+        [fit(who(item.sender), SENDER, measure), "name", chosen], [" "], [oneLine(item.subject || item.preview), "label"]],
+      right: [[age(item.created_at, now), "label"]],
+    } satisfies Line;
+  });
+  const hidden = items.length - shown.length;
+  if (hidden) lines.push({ left: [["  "], [`+${hidden} more · scroll to see`, "label"]] });
+  const [mark, tone, word] = badge(current);
+  lines.push("rule");
+  const header: Segment[] = [[mark, tone], [" "], [word, tone === "label" ? "name" : tone, true], [" from ", "label"], [current.sender, "name"]];
+  lines.push({ left: header, right: [[current.message_id.slice(0, 8), "label"]] });
+  if (current.target_message_id) {
+    const verb = current.urgency === "cancel" ? "cancels" : current.urgency === "amend" ? "adds to" : "replies to";
+    lines.push({ left: [["↳ ", "label"], [`${verb} ${current.target_message_id.slice(0, 8)}`, "label"]] });
+  }
+  if (current.subject) lines.push({ left: [[oneLine(current.subject), "name", true]] });
+  for (const text of wrap(oneLine(current.preview) || "(empty)", inner, BODY_ROWS, measure)) lines.push({ left: [[text, "name"]] });
+  return { lines, list: shown.map(item => item.message_id), listStart: start, selected: current.message_id };
+}
+
+export class MailboxBoard {
+  private selectedId?: string;
+  private list: string[] = [];
+  /** Row of the first list item inside the rendered board. */
+  private listTop = 2;
+  private height = 0;
+  private drag?: { x: number; y: number; ox: number; oy: number };
 
   constructor(private readonly options: {
     snapshot: () => BoardSnapshot;
-    placement: OverlayOptions;
-    bounds: () => OverlayBounds | undefined;
-    theme: BoardTheme;
-    keybindings: BoardKeybindings;
-    deps: BoardDeps;
+    overlay: OverlayOptions;
+    terminal: () => { columns: number; rows: number };
+    measure: Measure;
     requestRender: () => void;
-    close: () => void;
+    moved: (position: Position) => void;
+    now?: () => number;
   }) {}
 
   invalidate(): void {}
 
   render(width: number): string[] {
-    const { theme, deps } = this.options;
-    const { title, summary, items, urgent } = this.options.snapshot();
-    this.selected = Math.max(0, Math.min(this.selected, items.length - 1));
-    const inner = Math.max(10, width - 4);
-    const border = (text: string) => theme.fg("border", text);
-    const row = (content: string) => {
-      const cell = deps.truncateToWidth(content, inner, "…");
-      return border("│") + " " + cell + " ".repeat(Math.max(0, inner - deps.visibleWidth(cell))) + " " + border("│");
-    };
-    const rule = (left: string, label: string, right: string) => {
-      const text = label ? deps.truncateToWidth(label, Math.max(0, width - 5), "…") : "";
-      const fill = Math.max(0, width - 2 - (text ? deps.visibleWidth(text) + 2 : 0) - 1);
-      return border(left + "─") + (text ? " " + text + " " : "") + border("─".repeat(fill) + right);
-    };
-
-    const lines = [rule("╭", theme.fg("accent", theme.bold(title)) + theme.fg("dim", ` · ${items.length} shown · ${summary}`), "╮")];
-    if (!items.length) {
-      this.listTop = 1; this.listStart = 0;
-      lines.push(row(theme.fg("dim", "No queued mail.")));
-    } else {
-      this.listStart = Math.max(0, Math.min(this.selected - Math.floor(LIST_ROWS / 2), items.length - LIST_ROWS));
-      this.listTop = lines.length;
-      for (const [offset, item] of items.slice(this.listStart, this.listStart + LIST_ROWS).entries()) {
-        const index = this.listStart + offset;
-        const tag = item.urgency ? `[${item.urgency}]` : `[${item.kind}]`;
-        const color = item.urgency === "cancel" ? "error" : item.urgency === "amend" || urgent.has(item.message_id)
-          ? "warning" : item.kind === "action" ? "accent" : "muted";
-        const state = item.state === "delivering" ? " (delivering)" : "";
-        const head = `${index === this.selected ? theme.fg("accent", "›") : " "} ${theme.fg(color, tag)} ${item.sender}${state} — ${item.subject || item.preview}`;
-        lines.push(row(index === this.selected ? theme.bold(head) : head));
-      }
-      if (items.length > LIST_ROWS) lines.push(row(theme.fg("dim", `(${this.selected + 1}/${items.length})`)));
-      const current = items[this.selected];
-      lines.push(border("├" + "─".repeat(Math.max(0, width - 2)) + "┤"));
-      if (current.urgency) lines.push(row(theme.fg("warning", `${current.urgency} of ${current.target_message_id}`)));
-      for (const line of deps.wrapTextWithAnsi(current.preview || "(empty)", inner).slice(0, DETAIL_ROWS)) lines.push(row(line));
-      lines.push(row(theme.fg("dim", current.message_id)));
-    }
-    lines.push(rule("╰", theme.fg("dim", "↑↓ select · drag title or shift+arrows move · Esc close · view only"), "╯"));
-    return lines;
+    const { measure } = this.options;
+    const snapshot = this.options.snapshot();
+    const inner = width - 4;
+    const { lines, list, selected } = boardLines(snapshot, this.selectedId, inner, measure, this.options.now?.() ?? Date.now());
+    this.list = list;
+    this.selectedId = selected;
+    const queued = snapshot.items.length, urgent = snapshot.items.filter(item => item.urgency || snapshot.urgent.has(item.message_id)).length;
+    const facts = [snapshot.backend === "ham" ? "HAM" : "local", queued ? `${queued} queued` : "empty",
+      urgent && `${urgent} urgent`, snapshot.processing && "delivering"].filter(Boolean).join(" · ");
+    const title = ` ${fg(this.drag ? "ok" : "title", "mailbox", true)} `;
+    const note = ` ${fg(urgent ? "warn" : "label", facts)} `;
+    const out = [
+      titleRule(width, title, note, measure),
+      row({ left: [] }, width, measure),
+      ...lines.map(line => line === "rule" ? rule(width, ["├", "┤"]) : row(line, width, measure)),
+      row({ left: [] }, width, measure),
+      rule(width, ["╰", "╯"]),
+    ];
+    this.listTop = 2;
+    this.height = out.length;
+    return out;
   }
 
-  handleInput(data: string): void {
-    const { keybindings, deps, close } = this.options;
-    const count = this.options.snapshot().items.length;
-    const move = ([["shift+up", 0, -1], ["shift+down", 0, 1], ["shift+left", -2, 0], ["shift+right", 2, 0]] as const)
-      .find(([key]) => deps.matchesKey(data, key));
-    if (move) this.moveBy(move[1], move[2]);
-    else if (keybindings.matches(data, "tui.select.up")) this.selected = Math.max(0, this.selected - 1);
-    else if (keybindings.matches(data, "tui.select.down")) this.selected = Math.min(Math.max(0, count - 1), this.selected + 1);
-    else if (keybindings.matches(data, "tui.select.cancel") || keybindings.matches(data, "tui.select.confirm") || data === "q" ||
-             BOARD_KEYS.some(key => deps.matchesKey(data, key))) { close(); return; }
-    else return;
-    this.options.requestRender();
-  }
-
+  /** Fullscreen mode routes mouse input to overlays, including non-capturing ones. */
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    const { overlay } = this.options;
     if (this.drag) {
       if (event.type === "drag" || event.type === "move") {
-        this.place(event.screenY - this.drag.dy, event.screenX - this.drag.dx);
-        return { handled: true, render: true };
+        const { columns, rows } = this.options.terminal();
+        overlay.offsetX = Math.min(0, Math.max(-(columns - WIDTH), this.drag.ox + event.screenX - this.drag.x));
+        overlay.offsetY = Math.min(0, Math.max(-(rows - this.height), this.drag.oy + event.screenY - this.drag.y));
+        return { handled: true, capture: true, render: true };
       }
-      if (event.type === "release") {
+      if (event.type === "release" || event.type === "click") {
         this.drag = undefined;
-        // Keep the clamped on-screen position, not wherever the pointer left the terminal.
-        const bounds = this.options.bounds();
-        if (bounds) this.place(bounds.row, bounds.col);
+        this.options.moved({ offsetX: overlay.offsetX ?? 0, offsetY: overlay.offsetY ?? 0 });
         return { handled: true, render: true };
       }
+      return { handled: true, capture: true };
     }
     if (event.type === "press" && event.button === "left" && event.y === 0) {
-      this.drag = { dx: event.x, dy: event.y };
-      return { capture: true, focus: true };
+      this.drag = { x: event.screenX, y: event.screenY, ox: overlay.offsetX ?? 0, oy: overlay.offsetY ?? 0 };
+      return { capture: true, render: true };
     }
-    if (event.type === "wheel" && event.wheelDelta) {
-      const count = this.options.snapshot().items.length;
-      this.selected = Math.max(0, Math.min(Math.max(0, count - 1), this.selected + Math.sign(event.wheelDelta)));
-      return { handled: true, render: true };
+    if (event.type === "wheel" && event.wheelDelta) return this.step(Math.sign(event.wheelDelta));
+    if (event.type === "press" && event.button === "left") {
+      const id = this.list[event.y - this.listTop];
+      if (id) { this.selectedId = id; return { handled: true, render: true }; }
     }
-    if ((event.type === "press" || event.type === "click") && event.button === "left") {
-      const index = this.listStart + event.y - this.listTop;
-      const count = this.options.snapshot().items.length;
-      if (event.y >= this.listTop && event.y < this.listTop + LIST_ROWS && index >= 0 && index < count) this.selected = index;
-      return { handled: true, focus: true, render: true };
-    }
+    // Swallow the rest so a click on the panel never starts a transcript selection underneath.
     return { handled: true };
   }
 
-  private moveBy(dx: number, dy: number): void {
-    // Start from the rendered (already clamped) position so moves never accumulate off-screen.
-    const { placement } = this.options;
-    const bounds = this.options.bounds();
-    const row = bounds?.row ?? (typeof placement.row === "number" ? placement.row : 0);
-    const col = bounds?.col ?? (typeof placement.col === "number" ? placement.col : 0);
-    this.place(row + dy, col + dx);
-  }
-
-  private place(row: number, col: number): void {
-    // pi-tui clamps absolute row/col to the terminal; only negative values need care here.
-    this.options.placement.row = Math.max(0, row);
-    this.options.placement.col = Math.max(0, col);
+  private step(direction: number): TuiMouseEventResult {
+    const items = ordered(this.options.snapshot().items);
+    const index = items.findIndex(item => item.message_id === this.selectedId);
+    const next = items[Math.max(0, Math.min(items.length - 1, index + direction))];
+    if (next) this.selectedId = next.message_id;
+    return { handled: true, render: true };
   }
 }

@@ -13,6 +13,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { BOARD_KEYS } from "./src/board.ts";
+import { cardLines, parseBundle } from "./src/card.ts";
 import { PiMailbox, type Backend } from "./src/core.ts";
 import { callReceiver, hamAvailable, insideHerdr } from "./src/ham.ts";
 import { LocalMailbox, type Sender, type StoredMessage } from "./src/local.ts";
@@ -50,7 +51,8 @@ function line(message: StoredMessage): string {
 }
 
 const USAGE = [
-  "/mail, alt+m, ctrl+shift+m    toggle this session's mailbox board (view only; drag the title or shift+arrows to move)",
+  "/mail, alt+m, ctrl+shift+m    toggle this session's mailbox panel (view only; drag its title to move)",
+  "/mail board [on|off|reset]    show, hide, or move the panel back above the editor",
   "/mail agents                  list pi sessions you can address",
   "/mail send <to> [--fyi] <text>  queue mail for another pi session (as the user)",
   "/mail reply <id> <text>       reply to a message (as the user)",
@@ -68,6 +70,16 @@ export default async function piMailbox(pi: ExtensionAPI): Promise<void> {
   let store: LocalMailbox | undefined;
   const local = () => (store ??= new LocalMailbox());
   const mailbox = new PiMailbox(pi, kind === "ham" ? hamBackend : localBackend(local));
+
+  // Show injected bundles as a mail card; the agent still receives the full bundle text.
+  const { visibleWidth } = await import("@earendil-works/pi-tui");
+  pi.registerMessageRenderer("ham_mailbox", (message, options) => {
+    const raw = typeof message.content === "string" ? message.content : "";
+    const bundle = parseBundle(raw);
+    if (!bundle) return undefined;
+    return { render: (width: number) => cardLines(bundle, width, options.outputPad, options.expanded, visibleWidth,
+      options.keyText("app.tools.expand"), raw), invalidate() {} };
+  });
 
   pi.on("session_start", (_event, ctx) => mailbox.start(ctx));
   pi.on("session_shutdown", (_event, ctx) => mailbox.shutdown(ctx));
@@ -94,6 +106,12 @@ export default async function piMailbox(pi: ExtensionAPI): Promise<void> {
     const [verb = "", ...rest] = args.split(/\s+/).filter(Boolean);
     const notify = (text: string, level: "info" | "warning" | "error" = "info") => ctx.ui.notify(text, level);
     if (!verb || verb === "show") return mailbox.showMailbox(ctx);
+    if (verb === "board") {
+      const action = rest[0] ?? "toggle";
+      if (action !== "toggle" && action !== "on" && action !== "off" && action !== "reset")
+        return notify("Usage: /mail board [on|off|reset]", "error");
+      return mailbox.showMailbox(ctx, action);
+    }
     if (verb === "help") return notify(USAGE);
     if (kind === "ham")
       return notify("HAM mode: send/amend/cancel as the user from the HAM Mailbox (Threads: Enter reply, u amend, c cancel). " +
