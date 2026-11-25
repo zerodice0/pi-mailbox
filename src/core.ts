@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { MailboxBoard, boardPlacement, type BoardSnapshot } from "./board.ts";
 import { ReceiverError, type Call, type ClaimBundle, type Inspection, type NativeAgent, type NativeClaim,
   type NativeMessage, type Operation, type ReceiverReplies, type Registration, type Request, type Thresholds,
   type Urgency } from "./types.ts";
@@ -121,6 +122,9 @@ export class PiMailbox {
   private registrationFailures = 0;
   state?: Inspection;
   registration?: Registration;
+  /** Board overlay position for this session (shared with pi-tui overlay options). */
+  readonly placement = boardPlacement();
+  private board?: { close: () => void; rerender: () => void };
 
   private call: Call;
 
@@ -160,6 +164,7 @@ export class PiMailbox {
     this.render(ctx);
   }
   private render(ctx: ExtensionContext): void {
+    this.board?.rerender();
     if (this.errors.size) return;
     ctx.ui.setStatus(STATUS_KEY, statusText(this.state, this.pending.size, this.label));
   }
@@ -209,6 +214,7 @@ export class PiMailbox {
     if (this.timer) this.timers.clearTimeout(this.timer);
     if (this.safety) this.timers.clearInterval(this.safety);
     this.timer = this.safety = undefined; this.timerAt = Infinity;
+    this.board?.close();
     for (const pending of [...this.pending.values()])
       await this.release(pending, "unknown", "pi receiver shutdown without correlated ACK", ctx);
     this.pending.clear();
@@ -503,57 +509,42 @@ export class PiMailbox {
     this.schedule(ctx, 500);
   }
 
-  // ---- view-only mailbox overlay -------------------------------------------------------------
+  // ---- view-only mailbox board ---------------------------------------------------------------
+  snapshot(): BoardSnapshot {
+    return {
+      title: (this.backend.name === "ham" ? "HAM" : "Local") + " mailbox",
+      summary: statusText(this.state, this.pending.size, this.label) ?? "empty",
+      items: this.state?.inbox ?? [],
+      urgent: new Set((this.state?.urgent ?? []).map(item => item.message_id)),
+    };
+  }
+  /** Toggle the board overlay (alt+m, ctrl+shift+m, /mail). It reads live state and never ACKs. */
   async showMailbox(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui") { ctx.ui.notify("The mailbox needs interactive mode.", "error"); return; }
-    if (this.belongs(ctx)) {
+    if (this.board) { this.board.close(); return; }
+    const { truncateToWidth, visibleWidth, wrapTextWithAnsi, matchesKey } = await import("@earendil-works/pi-tui");
+    if (this.board) return;
+    let handle: { getBounds(): { row: number; col: number; width: number; height: number } | undefined } | undefined;
+    const board: { close: () => void; rerender: () => void } = { close: () => undefined, rerender: () => undefined };
+    this.board = board;
+    // Refresh in the background; the board re-renders when the state arrives.
+    if (this.belongs(ctx)) void (async () => {
       const registration = await this.register(ctx);
-      if (registration) {
-        try { this.state = await this.receiver("inspect", identity(registration.agent), ctx); }
-        catch (error) { this.report(ctx, error, "inspect"); }
-      }
+      if (!registration || !this.current(ctx)) return;
+      try { this.state = await this.receiver("inspect", identity(registration.agent), ctx); this.render(ctx); }
+      catch (error) { this.report(ctx, error, "inspect"); }
+    })();
+    try {
+      await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+        board.close = () => done();
+        board.rerender = () => tui.requestRender();
+        return new MailboxBoard({ snapshot: () => this.snapshot(), placement: this.placement, bounds: () => handle?.getBounds(),
+          theme, keybindings, deps: { truncateToWidth, visibleWidth, wrapTextWithAnsi, matchesKey },
+          requestRender: () => tui.requestRender(), close: () => done() });
+      }, { overlay: true, overlayOptions: this.placement, onHandle: value => { handle = value; } });
+    } finally {
+      if (this.board === board) this.board = undefined;
     }
-    const items = this.state?.inbox ?? [];
-    const urgent = new Set((this.state?.urgent ?? []).map(item => item.message_id));
-    const summary = statusText(this.state, this.pending.size, this.label) ?? "empty";
-    const title = (this.backend.name === "ham" ? "HAM" : "Local") + " mailbox";
-    const { truncateToWidth, wrapTextWithAnsi } = await import("@earendil-works/pi-tui");
-    await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
-      let selected = 0;
-      return {
-        render(width: number): string[] {
-          const inner = Math.max(10, width - 2);
-          const lines = [theme.fg("accent", theme.bold(title)) + theme.fg("dim",
-            ` · ${items.length} shown · view only (no ACK) · ${summary}`)];
-          if (!items.length) lines.push(theme.fg("dim", "No queued mail."));
-          items.forEach((item, index) => {
-            const tag = item.urgency ? `[${item.urgency}]` : `[${item.kind}]`;
-            const color = item.urgency === "cancel" ? "error" : item.urgency === "amend" || urgent.has(item.message_id)
-              ? "warning" : item.kind === "action" ? "accent" : "muted";
-            const state = item.state === "delivering" ? " (delivering)" : "";
-            const head = `${index === selected ? "›" : " "} ${theme.fg(color, tag)} ${item.sender}${state} — ${item.subject || item.preview}`;
-            lines.push(truncateToWidth(head, inner));
-          });
-          const current = items[selected];
-          if (current) {
-            lines.push(theme.fg("dim", "─".repeat(Math.min(inner, 40))));
-            if (current.urgency) lines.push(theme.fg("warning", `${current.urgency} of ${current.target_message_id}`));
-            for (const line of wrapTextWithAnsi(current.preview || "(empty)", inner).slice(0, 6)) lines.push(line);
-            lines.push(theme.fg("dim", current.message_id));
-          }
-          lines.push(theme.fg("dim", "↑↓ select · Esc close"));
-          return lines.map(line => truncateToWidth(" " + line, width));
-        },
-        handleInput(data: string): void {
-          if (keybindings.matches(data, "tui.select.up")) selected = Math.max(0, selected - 1);
-          else if (keybindings.matches(data, "tui.select.down")) selected = Math.min(Math.max(0, items.length - 1), selected + 1);
-          else if (keybindings.matches(data, "tui.select.cancel") || keybindings.matches(data, "tui.select.confirm") || data === "q") { done(); return; }
-          else return;
-          tui.requestRender();
-        },
-        invalidate(): void {},
-      };
-    }, { overlay: true, overlayOptions: { anchor: "top-right", width: "60%", margin: 1 } });
   }
 }
 

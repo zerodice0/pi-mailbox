@@ -11,11 +11,12 @@
 
 | 파일 | 역할 |
 |---|---|
-| `src/core.ts` | `PiMailbox`: idle, 초안, 입력 정지 판정, 긴급 처리(steer/abort), 주입, 세션 기록 기반 ACK, 상태 표시줄, overlay |
+| `src/core.ts` | `PiMailbox`: idle, 초안, 입력 정지 판정, 긴급 처리(steer/abort), 주입, 세션 기록 기반 ACK, 상태 표시줄 |
+| `src/board.ts` | 메일함 보드 overlay: 실시간 상태 표시, 선택, 마우스 끌기와 `shift+방향키`로 위치 이동(보기 전용) |
 | `src/types.ts` | 수신기 프로토콜 타입(HAM `ledger runtime` protocol 1과 같음) |
 | `src/ham.ts` | HAM 백엔드: `python3 -m ham cli ledger runtime ...` 호출과 응답 검증 |
 | `src/local.ts` | local 백엔드: 같은 프로토콜을 구현하는 파일 메일함, 송신(`send`, `urgent`, `handle`, `recover`) |
-| `index.ts` | 백엔드 선택, pi 이벤트 연결, `/mail`, `alt+m`, local 전용 `mailbox_*` 도구 |
+| `index.ts` | 백엔드 선택, pi 이벤트 연결, `/mail`, `alt+m`/`ctrl+shift+m`, local 전용 `mailbox_*` 도구 |
 
 `PiMailbox`는 백엔드와 다섯 가지 동작(`register`, `inspect`, `claim`, `applied`, `release`)으로만 통신합니다. 따라서 두 백엔드에서 큐 처리 동작이 같습니다.
 
@@ -37,6 +38,13 @@ pi-subagents의 자식 프로세스(`PI_SUBAGENT_CHILD`)에서는 아무것도 �
 - **amend:** 현재 run이 원본 thread를 처리하고 있고 editor가 비어 있으면, 그 amend만 claim해서 `steer`로 주입합니다. 그 밖의 경우에는 editor가 비어 있는 idle 상태에서 가장 먼저 처리합니다.
 - **긴급 claim:** turn state, coalesce, 시간당 횟수는 건너뛰고 hop 제한은 지킵니다. 원본이 아직 대기 중이면 원본도 함께 claim합니다.
 - **ACK:** 세션 기록에서 `ham_mailbox` custom message의 marker, details, sha256이 정확히 일치하는 항목을 찾았을 때만 `applied`를 보고합니다. idle 상태가 되었는데도 기록에 없고 pi 큐에도 없으면, 3초가 지난 뒤 `not_applied`로 되돌립니다. 그 밖의 불확실한 경우는 `unknown`으로 남기고, 다시 주입하지 않습니다.
+
+## 4-1. 메일함 보드
+
+- `/mail`, `alt+m`, `ctrl+shift+m`으로 열고 닫습니다. 같은 키를 다시 누르면 닫힙니다.
+- 보드는 렌더링할 때마다 `PiMailbox.state`를 읽습니다. 상태가 바뀌면(`render`) 보드도 다시 그립니다. 열 때 `inspect`를 한 번 비동기로 호출합니다.
+- 위치는 세션마다 하나인 overlay 옵션 객체(`placement`)에 둡니다. pi-tui는 이 객체의 `row`/`col`을 렌더링마다 읽고 터미널 안으로 제한합니다. 제목 줄을 끌면(fullscreen 모드의 마우스 capture) 또는 `shift+방향키`를 누르면 이 값을 바꿉니다. 끌기를 마치면 실제로 그려진 위치로 값을 맞춥니다.
+- 보드는 보기 전용입니다. 열거나 고르는 것만으로 ACK하지 않습니다.
 
 ## 5. local 백엔드 저장 구조
 

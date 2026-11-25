@@ -34,13 +34,24 @@ Herdr에 일회용 pi 세션을 띄우고 사용자 자격으로 메일을 보�
 - **idle 자동 처리:** idle 상태의 세션이 action 메일을 자동으로 처리했습니다. 기록은 `via=wake`, `delivered`이고, 근거는 `pi:accepted-journal:…`입니다.
 - **cancel:** 실행 중이던 `sleep 90`이 `Command aborted`로 중단되었습니다. 이어서 cancel이 `via=urgent`로 주입되었고 보고 턴이 시작되었습니다.
 - **발견한 문제:** 사용자(`user@HOST`)에게는 메일 주소가 없어서, 에이전트가 메일로 보고할 수 없었습니다. HAM `194be93`과 local 백엔드 모두, 사용자에게 보내는 보고는 응답으로 하도록 지침을 고쳤습니다.
-- **미검증 항목:** amend의 steer와 local 백엔드는 실제 모델로 아직 검증하지 않았습니다(단위 테스트와 e2e 테스트만 있습니다).
+- **미검증 항목:** local 백엔드는 실제 모델로 아직 검증하지 않았습니다(단위 테스트와 e2e 테스트만 있습니다).
+
+## 실제 환경 검증 (rogallyx, Linux, HAM 백엔드, 2026-11-25)
+
+일회용 pi 세션(`claude-haiku-5-5`)을 Herdr workspace에 띄우고, 관리 세션이 에이전트 자격으로 메일을 보내 확인했습니다. 시험 세션과 작업 디렉터리는 정리했습니다.
+
+- **수신기 등록:** `client=pi`, `extension_present=1`로 등록되었습니다. auto 선택은 `ham`이었습니다.
+- **idle 자동 처리:** `via=wake`, `delivered`로 기록되었고, 근거는 `pi:accepted-journal:…`입니다. 송신부터 전달까지 약 2.5분 걸렸습니다(입력 정지와 coalesce 대기).
+- **amend:** 실행 중인 run에 steer로 주입되었습니다(`via=urgent`). 세션 기록에서 tool result 바로 다음, 같은 run 안에 들어갔고, 에이전트가 보강 내용을 반영했습니다.
+- **cancel:** `sleep 120` 도중에 cancel을 보내자 명령이 중단되었습니다. 다음 단계는 실행되지 않았고, 에이전트가 응답으로 보고했습니다.
+- **메일함 보드:** `alt+m`, `ctrl+shift+m`(CSI u), `/mail`로 열고 닫았습니다. `shift+방향키`와 SGR 마우스 끌기로 위치를 옮겼고, 다시 열어도 위치가 유지되었습니다. 보드를 연 채로 메일을 보내고 회수했을 때 바로 반영되었습니다.
 
 ## 남은 작업
 
 1. **winmax2:** 온라인이 되면 HAM을 갱신하고(같은 commit), pi-mailbox를 설치합니다. 그 전까지 winmax2는 긴급 메시지(`urgency`가 있는 payload)를 `invalid_message`로 거부합니다.
-2. **실제 세션 검증:** amend의 steer와 local 백엔드를 실제 모델로 검증합니다. Linux(rogallyx)에서도 확인합니다.
+2. **실제 세션 검증:** local 백엔드를 실제 모델로 검증합니다. HAM 백엔드는 macOS와 Linux에서 모두 검증했습니다.
 3. **local 백엔드 운영 확인:** 여러 세션이 동시에 쓸 때의 잠금 대기 시간과 `fs.watch` 동작을 확인합니다.
+4. **HAM skill 문서:** HAM skill이 pi 메일함 overlay를 `/ham-mailbox`라고 적고 있습니다. 실제 명령은 `/mail`(`alt+m`, `ctrl+shift+m`)이므로 HAM 저장소에서 고쳐야 합니다.
 
 ## 지켜야 할 계약
 

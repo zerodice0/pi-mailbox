@@ -12,6 +12,7 @@
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { BOARD_KEYS } from "./src/board.ts";
 import { PiMailbox, type Backend } from "./src/core.ts";
 import { callReceiver, hamAvailable, insideHerdr } from "./src/ham.ts";
 import { LocalMailbox, type Sender, type StoredMessage } from "./src/local.ts";
@@ -49,7 +50,7 @@ function line(message: StoredMessage): string {
 }
 
 const USAGE = [
-  "/mail                         show this session's mailbox (view only)",
+  "/mail, alt+m, ctrl+shift+m    toggle this session's mailbox board (view only; drag the title or shift+arrows to move)",
   "/mail agents                  list pi sessions you can address",
   "/mail send <to> [--fyi] <text>  queue mail for another pi session (as the user)",
   "/mail reply <id> <text>       reply to a message (as the user)",
@@ -80,7 +81,10 @@ export default async function piMailbox(pi: ExtensionAPI): Promise<void> {
   pi.on("message_end", (_event, ctx) => mailbox.activity(ctx));
   pi.on("turn_end", (_event, ctx) => mailbox.activity(ctx));
 
-  pi.registerShortcut("alt+m", { description: "Show the mailbox (view only)", handler: async ctx => mailbox.showMailbox(ctx) });
+  // ctrl+shift+m needs a terminal that reports modified keys (kitty protocol or modifyOtherKeys);
+  // alt+m works everywhere. Linux input methods (fcitx5/IBus) may take ctrl+shift combinations.
+  for (const key of BOARD_KEYS)
+    pi.registerShortcut(key, { description: "Toggle the mailbox board (view only)", handler: async ctx => mailbox.showMailbox(ctx) });
   pi.registerCommand("mail", {
     description: "Mailbox: show, send, reply, amend or cancel mail between pi sessions",
     handler: async (args, ctx) => { await command(args.trim(), ctx); },
