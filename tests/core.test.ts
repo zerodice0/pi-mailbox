@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PiMailbox, acceptedEntry, statusText, type Timers } from "../src/core.ts";
+import { PiMailbox, STALE_TURN_MS, acceptedEntry, isTyping, statusText, type Timers } from "../src/core.ts";
 import { parseReply } from "../src/ham.ts";
 import type { Call, ClaimBundle, Inspection, NativeMessage, UrgentItem } from "../src/types.ts";
 
@@ -47,7 +47,9 @@ class Harness {
   state = inspection();
   claims: ClaimBundle[] = [];
   environment: Record<string, string | undefined> = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "w1:p2" };
-  timers: Timers = { setTimeout: () => ({}), clearTimeout: () => undefined, setInterval: () => ({}), clearInterval: () => undefined };
+  clock = 1_000_000;
+  timers: Timers = { setTimeout: () => ({}), clearTimeout: () => undefined, setInterval: () => ({}), clearInterval: () => undefined,
+    now: () => this.clock };
   context: ExtensionContext;
   mailbox: PiMailbox;
   handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
@@ -300,7 +302,7 @@ test("/mail why explains each blocked wake gate, including a turn flag that neve
   expect(text).toContain("receiver still thinks a turn is running");
   await harness.kick();
   expect(harness.claimCalls()).toEqual([]);
-  expect(await harness.mailbox.explain(harness.context)).toMatch(/Last skipped: pi is idle, but the receiver still thinks a turn is running \(agent_settled never arrived\) \(for \d+s\)/);
+  expect(await harness.mailbox.explain(harness.context)).toMatch(/Last skipped: pi is idle, but the receiver still thinks a turn is running \(agent_settled never arrived\); it is dropped after 60s \(for \d+s\)/);
 
   harness.mailbox.settled(harness.context);
   expect(await harness.mailbox.explain(harness.context)).toContain("Now: ready; the next check claims and delivers the mail.");
@@ -313,4 +315,62 @@ test("/mail why reports an empty queue and a declined claim", async () => {
   harness.state = inspection({ has_action: true, queued_total: 1 });
   await harness.kick();  // no claim bundle queued in the harness: the backend declines
   expect(await harness.mailbox.explain(harness.context)).toContain("Last skipped: HAM declined the wake claim: empty");
+});
+
+test("persistent custom panels are not dialogs; a real dialog blocks until it closes or the editor submits", async () => {
+  const harness = new Harness();
+  await harness.start();
+  harness.state = inspection({ has_action: true, queued_total: 1 });
+  harness.mailbox.prompt(true, harness.context, "custom");   // quota / pi-team / mailbox board overlay
+  harness.claims.push(bundle([THREAD_A]));
+  await harness.kick();
+  expect(harness.sent.length).toBe(1);
+
+  const blocked = new Harness();
+  await blocked.start();
+  blocked.state = inspection({ has_action: true, queued_total: 1 });
+  blocked.mailbox.prompt(true, blocked.context, "select");
+  await blocked.kick();
+  expect(blocked.claimCalls()).toEqual([]);
+  expect(await blocked.mailbox.explain(blocked.context)).toContain("an extension dialog is open (1)");
+  blocked.mailbox.input(blocked.context);                     // ui_prompt_end was lost, the editor submitted
+  const text = await blocked.mailbox.explain(blocked.context);
+  expect(text).toContain("dialogs 0");
+  expect(text).toMatch(/Recovered: dropped a stuck dialog count \(the editor submitted a prompt\) 0s ago/);
+});
+
+test("a turn flag that outlives the turn is dropped after pi stays idle for STALE_TURN_MS", async () => {
+  const harness = new Harness();
+  await harness.start();
+  harness.state = inspection({ has_action: true, queued_total: 1 });
+  harness.mailbox.agentStart(harness.context);   // agent_settled never arrives; pi is idle
+  harness.claims.push(bundle([THREAD_A]));
+  await harness.kick();
+  expect(harness.sent.length).toBe(0);
+  harness.clock += STALE_TURN_MS - 1;
+  await harness.kick();
+  expect(harness.sent.length).toBe(0);
+  harness.clock += 1;
+  await harness.kick();   // drops the flag
+  await harness.kick();
+  expect(harness.sent.length).toBe(1);
+  expect(await harness.mailbox.explain(harness.context)).toContain("Recovered: dropped a stuck turn running flag");
+
+  // Not while pi itself is busy or still has queued messages.
+  const busy = new Harness();
+  await busy.start();
+  busy.state = inspection({ has_action: true, queued_total: 1 });
+  busy.mailbox.agentStart(busy.context);
+  busy.queuedInPi = true;
+  await busy.kick();
+  busy.clock += STALE_TURN_MS * 5;
+  await busy.kick();
+  expect(await busy.mailbox.explain(busy.context)).toContain("turn running yes");
+});
+
+test("only typing and paste count as input; mouse, focus and terminal replies do not", () => {
+  for (const data of ["a", "한", "\r", "\x1b[A", "\x1b[109;6u", "\x1b[200~paste\x1b[201~", "\x1b"]) expect(isTyping(data)).toBe(true);
+  for (const data of ["\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\x1b[<32;11;5M\x1b[<0;11;5m", "\x1b[<64;3;3M", "\x1b[M !!",
+    "\x1b[12;40R", "\x1b[?62;22c", "\x1b[>1;10;0c", "\x1b[?1u", "\x1b]11;rgb:0000/0000/0000\x07", "\x1bP>|kitty\x1b\\", ""])
+    expect(isTyping(data)).toBe(false);
 });

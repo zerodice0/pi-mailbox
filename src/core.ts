@@ -75,7 +75,17 @@ export interface Timers {
   clearTimeout(timer: Timer): void;
   setInterval(callback: () => void, delay: number): Timer;
   clearInterval(timer: Timer): void;
+  /** Clock for the stale-state recovery; tests replace it. */
+  now?(): number;
 }
+/** How long pi may report idle while the receiver still holds a turn open before the flag is dropped. */
+export const STALE_TURN_MS = 60000;
+/**
+ * Terminal input that is not the user typing: focus reports, mouse reports (SGR and X10), cursor
+ * position and device attribute replies, kitty keyboard flag replies, OSC and DCS replies.
+ */
+const NOT_TYPING = /^(?:\x1b\[[IO]|\x1b\[<[\d;]*[Mm]|\x1b\[M[\s\S]{3}|\x1b\[\d+;\d+R|\x1b\[[?>][\d;]*c|\x1b\[\?\d*u|\x1b\][\s\S]*(?:\x07|\x1b\\)|\x1bP[\s\S]*\x1b\\)+$/;
+export const isTyping = (data: string): boolean => data.length > 0 && !NOT_TYPING.test(data);
 const unref = <T>(timer: T): T => {
   (timer as { unref?: () => void } | undefined)?.unref?.();
   return timer;
@@ -118,6 +128,10 @@ export class PiMailbox {
   private preparing = 0;
   private running = false;
   private blocked = 0;
+  /** When pi was first seen idle while `running` was still set. */
+  private staleSince?: number;
+  /** The last time the receiver dropped a stuck flag on its own, shown by `/mail why`. */
+  private lastRecovery?: { what: string; at: number };
   private abortRequested = false;
   private refreshNeeded = true;
   private errors = new Map<string, number>();
@@ -204,8 +218,8 @@ export class PiMailbox {
     this.running = ctx.isIdle() === false;
     this.lastKey = Date.now();
     this.unsubscribe = ctx.ui.onTerminalInput(data => {
-      // Focus reports are not typing; actual typing/paste resets the quiet time.
-      if (data !== "\x1b[I" && data !== "\x1b[O") { this.lastKey = Date.now(); this.inputSerial++; this.schedule(this.ctx ?? ctx, 1000); }
+      // Only typing and paste reset the quiet time; mouse, focus and terminal replies do not.
+      if (isTyping(data)) { this.lastKey = Date.now(); this.inputSerial++; this.schedule(this.ctx ?? ctx, 1000); }
       return undefined;
     });
     this.safety = this.timers.setInterval(() => { this.refreshNeeded = true; void this.kick(this.ctx ?? ctx); }, 300000);
@@ -343,6 +357,7 @@ export class PiMailbox {
     }
   }
   private async probe(ctx: ExtensionContext): Promise<void> {
+    this.recoverStaleTurn(ctx);
     const registration = await this.register(ctx);
     if (!registration || !this.current(ctx)) return;
     await this.confirm(ctx);
@@ -440,9 +455,10 @@ export class PiMailbox {
     const blockers: { text: string; retry?: () => void }[] = [];
     if (!this.idle(ctx)) {
       const idleNow = ctx.isIdle();
-      if (this.running) blockers.push({ text: idleNow
-        ? "pi is idle, but the receiver still thinks a turn is running (agent_settled never arrived)"
-        : "a turn is running" });
+      if (this.running) blockers.push(idleNow && !ctx.hasPendingMessages()
+        ? { text: "pi is idle, but the receiver still thinks a turn is running (agent_settled never arrived);" +
+            ` it is dropped after ${STALE_TURN_MS / 1000}s`, retry: () => this.schedule(ctx, 5000) }
+        : { text: "a turn is running" });
       if (this.blocked) blockers.push({ text: `an extension dialog is open (${this.blocked})`, retry: () => this.schedule(ctx, 1000) });
       if (this.preparing) blockers.push({ text: "a user prompt is being prepared", retry: () => this.schedule(ctx, 1000) });
       if (!idleNow && !this.running) blockers.push({ text: "pi is busy", retry: () => this.schedule(ctx, 1000) });
@@ -473,6 +489,19 @@ export class PiMailbox {
     const coalesce = state.coalesce_until * 1000 - Date.now();
     if (coalesce > 0) return [{ text: `collecting mail for ${Math.ceil(coalesce / 1000)}s more`, retry: () => this.schedule(ctx, coalesce) }];
     return [];
+  }
+
+  private now(): number { return this.timers.now?.() ?? Date.now(); }
+  private recovered(what: string): void { this.lastRecovery = { what, at: this.now() }; }
+  /** Drop a `running` flag that outlived the turn: pi has been idle with an empty queue for a while. */
+  private recoverStaleTurn(ctx: ExtensionContext): void {
+    if (!this.running || !ctx.isIdle() || ctx.hasPendingMessages()) { this.staleSince = undefined; return; }
+    const now = this.now();
+    this.staleSince ??= now;
+    if (now - this.staleSince < STALE_TURN_MS) return;
+    this.staleSince = undefined;
+    this.recovered("turn running flag (agent_settled never arrived)");
+    this.settled(ctx);
   }
 
   private skip(reason: string | undefined): void {
@@ -534,23 +563,31 @@ export class PiMailbox {
   }
   input(ctx: ExtensionContext): void {
     if (!this.belongs(ctx)) return;
+    // The editor just submitted a prompt, so no modal dialog can be holding the keyboard.
+    if (this.blocked) { this.blocked = 0; this.recovered("dialog count (the editor submitted a prompt)"); }
     this.lastKey = Date.now(); this.inputSerial++;
     this.schedule(ctx);
   }
   agentStart(ctx: ExtensionContext): void {
     if (!this.belongs(ctx)) return;
-    this.running = true;
+    this.running = true; this.staleSince = undefined;
     this.schedule(ctx);
   }
   settled(ctx: ExtensionContext): void {
     if (!this.belongs(ctx)) return;
-    this.running = false; this.abortRequested = false;
+    this.running = false; this.abortRequested = false; this.staleSince = undefined;
     this.activeThreads.clear();
     this.refreshNeeded = true;
     void this.confirm(ctx).then(() => this.schedule(ctx, 0));
   }
-  prompt(start: boolean, ctx: ExtensionContext): void {
-    if (!this.belongs(ctx)) return;
+  /**
+   * pi reports select/confirm/input/editor dialogs and every `ctx.ui.custom()` the same way, but only
+   * when its nesting depth leaves or returns to zero. Persistent panels (this board, quota, pi-team)
+   * are `custom` overlays that stay open for hours, so `custom` is not treated as a dialog: a modal
+   * custom view is still covered by the input-quiet gate while the user types in it.
+   */
+  prompt(start: boolean, ctx: ExtensionContext, kind?: string): void {
+    if (!this.belongs(ctx) || kind === "custom") return;
     this.blocked = Math.max(0, this.blocked + (start ? 1 : -1));
     this.schedule(ctx);
   }
@@ -592,6 +629,7 @@ export class PiMailbox {
     if (!state.queued_total) lines.push("Now: nothing is waiting.");
     else if (!blockers.length) lines.push("Now: ready; the next check claims and delivers the mail.");
     else lines.push(...blockers.map((blocker, index) => `${index ? "     " : "Now: "}waiting — ${blocker.text}`));
+    if (this.lastRecovery) lines.push(`Recovered: dropped a stuck ${this.lastRecovery.what} ${ago(this.now() - this.lastRecovery.at)} ago`);
     if (this.lastSkip && state.queued_total)
       lines.push(`Last skipped: ${this.lastSkip.reason} (for ${ago(Date.now() - this.lastSkip.since)})`);
     this.schedule(ctx, 0);

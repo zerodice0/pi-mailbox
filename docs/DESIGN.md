@@ -48,6 +48,15 @@ pi-subagents의 자식 프로세스(`PI_SUBAGENT_CHILD`)에서는 아무것도 �
 - pi는 idle인데 수신기의 "턴 실행 중" 표시가 남아 있으면 따로 알립니다(`agent_settled`를 놓친 경우).
 - 마지막으로 자동 처리를 건너뛴 이유와 그 이유가 유지된 시간을 메모리에 둡니다. `/mail why`는 `inspect`만 호출하며 claim이나 ACK를 하지 않습니다.
 
+### 멈춘 상태 복구와 입력 판정
+
+- pi는 select/confirm/input/editor 대화상자와 모든 `ctx.ui.custom()`을 같은 `ui_prompt_start`/`ui_prompt_end`로 알리며, 중첩 깊이가 0에서 바뀔 때만 보냅니다. 메일함, 쿼터, pi-team 패널은 몇 시간씩 열려 있는 `custom` overlay라서, 이를 대화상자로 세면 패널이 떠 있는 동안 자동 처리가 멈춥니다. 그래서 `custom`은 대화상자로 세지 않습니다. 사용자가 modal custom 화면에 입력하는 동안은 입력 정지 조건이 막습니다.
+- editor가 프롬프트를 제출하면 modal 대화상자가 열려 있을 수 없으므로, 남은 대화상자 카운터를 0으로 되돌립니다.
+- pi가 idle이고 pi 대기열도 빈 상태로 60초(`STALE_TURN_MS`) 넘게 "턴 실행 중" 표시가 남으면, `agent_settled`를 놓친 것으로 보고 표시를 풉니다.
+- 입력 정지 시간은 타이핑과 붙여넣기만 초기화합니다. 마우스, focus 보고, 커서 위치·장치 속성·kitty 키보드 응답, OSC·DCS 응답은 입력으로 세지 않습니다(`isTyping`).
+- 스스로 푼 상태는 `/mail why`의 `Recovered:` 줄에 보입니다.
+- `/mail`, `/mail board`, 단축키는 패널을 기다리지 않습니다. 기다리면 패널이 닫힐 때까지 pi의 slash 명령 대기열이 막힙니다.
+
 ## 4-1. 메일함 패널과 메일 카드
 
 - **패널:** `/mail`, `alt+m`, `ctrl+shift+m`으로 열고 닫습니다(`/mail board on|off|reset`).

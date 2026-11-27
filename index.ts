@@ -89,29 +89,35 @@ export default async function piMailbox(pi: ExtensionAPI): Promise<void> {
   pi.on("before_agent_start", (event, ctx) => mailbox.natural(event, ctx));
   pi.on("agent_start", (_event, ctx) => mailbox.agentStart(ctx));
   pi.on("agent_settled", (_event, ctx) => mailbox.settled(ctx));
-  pi.on("ui_prompt_start", (_event, ctx) => mailbox.prompt(true, ctx));
-  pi.on("ui_prompt_end", (_event, ctx) => mailbox.prompt(false, ctx));
+  pi.on("ui_prompt_start", (event, ctx) => mailbox.prompt(true, ctx, event.kind));
+  pi.on("ui_prompt_end", (event, ctx) => mailbox.prompt(false, ctx, event.kind));
   pi.on("message_end", (_event, ctx) => mailbox.activity(ctx));
   pi.on("turn_end", (_event, ctx) => mailbox.activity(ctx));
 
   // ctrl+shift+m needs a terminal that reports modified keys (kitty protocol or modifyOtherKeys);
   // alt+m works everywhere. Linux input methods (fcitx5/IBus) may take ctrl+shift combinations.
   for (const key of BOARD_KEYS)
-    pi.registerShortcut(key, { description: "Toggle the mailbox board (view only)", handler: async ctx => mailbox.showMailbox(ctx) });
+    pi.registerShortcut(key, { description: "Toggle the mailbox board (view only)", handler: async ctx => openBoard(ctx) });
   pi.registerCommand("mail", {
     description: "Mailbox: show, send, reply, amend or cancel mail between pi sessions",
     handler: async (args, ctx) => { await command(args.trim(), ctx); },
   });
 
+  // The board stays open until hidden; awaiting it would hold pi's command queue the whole time.
+  function openBoard(ctx: ExtensionContext, action?: "toggle" | "on" | "off" | "reset"): void {
+    mailbox.showMailbox(ctx, action).catch(error => ctx.ui.notify(`mailbox board: ${String(error)}`, "error"));
+  }
+
   async function command(args: string, ctx: ExtensionContext): Promise<void> {
     const [verb = "", ...rest] = args.split(/\s+/).filter(Boolean);
     const notify = (text: string, level: "info" | "warning" | "error" = "info") => ctx.ui.notify(text, level);
-    if (!verb || verb === "show") return mailbox.showMailbox(ctx);
+    if (!verb || verb === "show") { openBoard(ctx); return; }
     if (verb === "board") {
       const action = rest[0] ?? "toggle";
       if (action !== "toggle" && action !== "on" && action !== "off" && action !== "reset")
         return notify("Usage: /mail board [on|off|reset]", "error");
-      return mailbox.showMailbox(ctx, action);
+      openBoard(ctx, action);
+      return;
     }
     if (verb === "help") return notify(USAGE);
     if (verb === "why") return notify(await mailbox.explain(ctx));
