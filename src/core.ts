@@ -31,6 +31,12 @@ type Phase = "prepared" | "sent" | "unknown";
 type Pending = NativeClaim & { phase: Phase; preparation?: string; message?: NativeMessage; threads: string[]; sentAt?: number };
 
 const WAKE_READY_STATES: Record<string, true> = { idle: true, done: true };
+/**
+ * Backend capability: a wake claim may carry this receiver's own idle observation, and the backend
+ * then skips Herdr's screen-derived turn_state gate. pi knows its idle state first-hand.
+ */
+export const PI_OBSERVED_IDLE = "pi_observed_idle";
+const observesIdle = (state: Inspection) => state.capabilities?.includes(PI_OBSERVED_IDLE) === true;
 const STATUS_KEY = "pi-mailbox";
 /** A triggered run journals its message at run start; give that start time before judging absence. */
 const SENT_GRACE_MS = 3000;
@@ -143,6 +149,8 @@ export class PiMailbox {
   private lastError?: string;
   /** The most recent reason a wake was not attempted, and since when it has held. */
   private lastSkip?: { reason: string; since: number };
+  /** idle_source of the last wake claim, when the backend reports it. */
+  private idleSource?: string;
   private board?: { close: () => void; rerender: () => void };
 
   private call: Call;
@@ -481,7 +489,7 @@ export class PiMailbox {
       text: `terminal input ${Math.round(quietFor / 1000)}s ago; waits for ${thresholds.idle_minutes} min without input`,
       retry: () => this.schedule(ctx, Math.max(1000, this.lastKey + needed - Date.now())) });
     if (blockers.length) return blockers;
-    if (!Object.hasOwn(WAKE_READY_STATES, state.turn_state))
+    if (!observesIdle(state) && !Object.hasOwn(WAKE_READY_STATES, state.turn_state))
       return [{ text: `HAM reports turn state '${state.turn_state}', not idle/done (Herdr's view of this pane)`,
         retry: () => { this.refreshNeeded = true; this.schedule(ctx, 1000); } }];
     if (state.wake_count >= thresholds.wakes_per_hour)
@@ -513,8 +521,15 @@ export class PiMailbox {
     const [blocker] = this.wakeBlockers(ctx, state);
     if (blocker) { this.skip(blocker.text); blocker.retry?.(); return; }
     const serial = this.inputSerial;
-    const claim = await this.receiver("claim", { ...identity(registration.agent), wake: true }, ctx);
-    if (claim.claim_id === null) { this.skip(`${this.label} declined the wake claim: ${claim.reason}`); return; }
+    // pi was idle at the gate above; the backend rejects an observation older than 60s.
+    const observation = observesIdle(state) ? { observed_idle: true, observed_at: this.now() / 1000 } : {};
+    const claim = await this.receiver("claim", { ...identity(registration.agent), wake: true, ...observation }, ctx);
+    if (claim.claim_id === null) {
+      this.skip(`${this.label} declined the wake claim: ${claim.reason}`);
+      if (claim.reason === "observed_stale") this.schedule(ctx, 1000);
+      return;
+    }
+    this.idleSource = claim.idle_source;
     const pending = this.track(claim, "prepared");
     // No await may separate this final idle/editor/session check and sendMessage.
     if (!this.current(ctx) || serial !== this.inputSerial || !this.idle(ctx) || !this.quiet(ctx, state.thresholds, claim.skip_input_quiet)) {
@@ -616,6 +631,8 @@ export class PiMailbox {
     const actions = state.inbox.filter(item => item.kind === "action").length;
     lines.push(`Queue: ${state.queued_total} queued (${actions} action, ${state.urgent.length} urgent)` +
       ` · turn state ${state.turn_state} · wakes ${state.wake_count}/${state.thresholds.wakes_per_hour} this hour`);
+    lines.push(`Idle evidence: ${observesIdle(state) ? "pi's own idle state (Herdr turn state not required)" : "Herdr turn state (idle/done)"}` +
+      (this.idleSource ? ` · last wake admitted by ${this.idleSource}` : ""));
     lines.push(`Session: pi ${ctx.isIdle() ? "idle" : "busy"} · turn running ${this.running ? "yes" : "no"} · dialogs ${this.blocked}` +
       ` · preparing ${this.preparing} · pi queue ${ctx.hasPendingMessages() ? "not empty" : "empty"}`);
     lines.push(`Input: editor ${this.editorEmpty(ctx) ? "empty" : "has a draft"} · last input ${ago(Date.now() - this.lastKey)} ago` +

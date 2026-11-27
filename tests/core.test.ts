@@ -278,6 +278,9 @@ test("status text, journal matching and reply parsing", () => {
   expect(parsed.urgent[0].urgency).toBe("amend");
   expect(parsed.inbox).toEqual([]);
   expect(() => parseReply("inspect", { ...inspection(), urgent: [{ ...urgent("amend"), urgency: "steer" }] })).toThrow();
+  expect(parsed.capabilities).toBeUndefined();
+  expect(parseReply("inspect", { ...inspection(), capabilities: ["pi_observed_idle"] }).capabilities).toEqual(["pi_observed_idle"]);
+  expect(() => parseReply("inspect", { ...inspection(), capabilities: [1] })).toThrow();
 });
 
 test("/mail why explains each blocked wake gate, including a turn flag that never settled", async () => {
@@ -373,4 +376,35 @@ test("only typing and paste count as input; mouse, focus and terminal replies do
   for (const data of ["\x1b[I", "\x1b[O", "\x1b[<0;10;5M", "\x1b[<32;11;5M\x1b[<0;11;5m", "\x1b[<64;3;3M", "\x1b[M !!",
     "\x1b[12;40R", "\x1b[?62;22c", "\x1b[>1;10;0c", "\x1b[?1u", "\x1b]11;rgb:0000/0000/0000\x07", "\x1bP>|kitty\x1b\\", ""])
     expect(isTyping(data)).toBe(false);
+});
+
+test("with pi_observed_idle the wake claim carries pi's idle observation and ignores Herdr's turn state", async () => {
+  const harness = new Harness();
+  await harness.start();
+  harness.state = inspection({ has_action: true, queued_total: 1, turn_state: "working", capabilities: ["pi_observed_idle"] });
+  harness.claims.push({ ...bundle([THREAD_A]), idle_source: "pi_observed_idle" });
+  await harness.kick();
+  expect(harness.claimCalls()).toEqual([{ ...harness.claimCalls()[0], wake: true, observed_idle: true, observed_at: harness.clock / 1000 }]);
+  expect(harness.sent.length).toBe(1);
+  expect(await harness.mailbox.explain(harness.context)).toContain("last wake admitted by pi_observed_idle");
+
+  // Without the capability (older HAM, local backend) nothing extra is sent and turn_state still gates.
+  const old = new Harness();
+  await old.start();
+  old.state = inspection({ has_action: true, queued_total: 1, turn_state: "working" });
+  await old.kick();
+  expect(old.claimCalls()).toEqual([]);
+  old.state = { ...old.state, turn_state: "idle" };
+  await old.kick();
+  expect(old.claimCalls()[0]).not.toHaveProperty("observed_idle");
+});
+
+test("a stale observation is retried instead of falling back", async () => {
+  const harness = new Harness();
+  await harness.start();
+  harness.state = inspection({ has_action: true, queued_total: 1, capabilities: ["pi_observed_idle"] });
+  harness.claims.push({ claim_id: null, reason: "observed_stale" } as never);
+  await harness.kick();
+  expect(harness.sent.length).toBe(0);
+  expect(await harness.mailbox.explain(harness.context)).toContain("Last skipped: HAM declined the wake claim: observed_stale");
 });

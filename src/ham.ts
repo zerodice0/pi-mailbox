@@ -70,7 +70,8 @@ function inspection(value: Request): Inspection {
     role: value.role, turn_state: string(value.turn_state), wake_count: number(value.wake_count),
     pending_claims: array(value.pending_claims).map(nativeClaim), has_action: value.has_action,
     coalesce_until: number(value.coalesce_until), skip_input_quiet: skipInputQuiet(value), urgent, inbox,
-    queued_total: value.queued_total === undefined ? inbox.length : number(value.queued_total) };
+    queued_total: value.queued_total === undefined ? inbox.length : number(value.queued_total),
+    capabilities: value.capabilities === undefined ? undefined : array(value.capabilities).map(string) };
 }
 export function parseReply<O extends Operation>(operation: O, raw: unknown): ReceiverReplies[O] {
   const value = record(raw);
@@ -90,6 +91,7 @@ export function parseReply<O extends Operation>(operation: O, raw: unknown): Rec
         throw new Error("Invalid HAM context message");
       parsed = { ...nativeClaim(value), skip_input_quiet: skipInputQuiet(value),
         via: typeof value.via === "string" ? value.via : undefined,
+        idle_source: typeof value.idle_source === "string" ? value.idle_source : undefined,
         messages: array(value.messages).map(item => {
           const row = record(item);
           return { message_id: string(row.message_id), thread_id: string(row.thread_id), kind: string(row.kind),

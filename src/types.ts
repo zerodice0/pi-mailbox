@@ -11,6 +11,8 @@ export interface NativeMessage { customType: "ham_mailbox"; content: string; det
 export interface ClaimedMessage { message_id: string; thread_id: string; kind: string; urgency: Urgency | null }
 export interface ClaimBundle extends NativeClaim {
   message: NativeMessage; messages: ClaimedMessage[]; skip_input_quiet?: boolean; via?: string;
+  /** Which idle evidence admitted a wake claim: "pi_observed_idle" or "turn_state" (newer HAM only). */
+  idle_source?: string;
 }
 export interface Thresholds { idle_minutes: number; coalesce_seconds: number; wakes_per_hour: number; max_hop: number }
 export interface UrgentItem { message_id: string; urgency: Urgency; target_message_id: string; thread_id: string }
@@ -22,6 +24,8 @@ export interface Inspection {
   thresholds: Thresholds; role: "main" | "worker" | null; turn_state: string; wake_count: number;
   pending_claims: NativeClaim[]; has_action: boolean; coalesce_until: number; skip_input_quiet?: boolean;
   urgent: UrgentItem[]; inbox: InboxItem[]; queued_total: number;
+  /** Receiver features the backend accepts, e.g. "pi_observed_idle". Absent on older ledgers. */
+  capabilities?: string[];
 }
 export interface Registration extends Inspection { agent: NativeAgent; bell_directory: string; bell_name: string }
 export interface ReceiverReplies {

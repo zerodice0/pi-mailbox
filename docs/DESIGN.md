@@ -48,6 +48,14 @@ pi-subagents의 자식 프로세스(`PI_SUBAGENT_CHILD`)에서는 아무것도 �
 - pi는 idle인데 수신기의 "턴 실행 중" 표시가 남아 있으면 따로 알립니다(`agent_settled`를 놓친 경우).
 - 마지막으로 자동 처리를 건너뛴 이유와 그 이유가 유지된 시간을 메모리에 둡니다. `/mail why`는 `inspect`만 호출하며 claim이나 ACK를 하지 않습니다.
 
+### pi의 idle 확인으로 깨우기(`pi_observed_idle`)
+
+- HAM `dc42031` 이후 `inspect` 응답의 `capabilities`에 `pi_observed_idle`이 있으면, wake claim에 `observed_idle: true`와 `observed_at`(epoch 초)을 함께 보냅니다. HAM은 60초 이내의 확인이면 Herdr turn 상태 조건만 건너뛰고, 역할·시간당 횟수·묶음 대기·hop 조건은 그대로 확인합니다.
+- 이때 pi-mailbox도 HAM turn 상태 사전 검사를 하지 않습니다. pi의 idle 판단은 세션 안의 조건(턴 실행, 대화상자, pi 대기열, editor, 입력 정지)으로만 합니다.
+- 확인이 오래되어 HAM이 `observed_stale`로 거절하면 turn 상태로 대신 판정하지 않고 1초 뒤 다시 시도합니다.
+- capability가 없는 옛 HAM과 local 백엔드에는 필드를 보내지 않습니다. 옛 HAM은 모르는 필드를 `invalid_request`로 거절하기 때문입니다.
+- `/mail why`의 `Idle evidence:` 줄에 어느 근거를 쓰는지와 마지막 wake의 `idle_source`가 보입니다.
+
 ### 멈춘 상태 복구와 입력 판정
 
 - pi는 select/confirm/input/editor 대화상자와 모든 `ctx.ui.custom()`을 같은 `ui_prompt_start`/`ui_prompt_end`로 알리며, 중첩 깊이가 0에서 바뀔 때만 보냅니다. 메일함, 쿼터, pi-team 패널은 몇 시간씩 열려 있는 `custom` overlay라서, 이를 대화상자로 세면 패널이 떠 있는 동안 자동 처리가 멈춥니다. 그래서 `custom`은 대화상자로 세지 않습니다. 사용자가 modal custom 화면에 입력하는 동안은 입력 정지 조건이 막습니다.
