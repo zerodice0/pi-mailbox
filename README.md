@@ -47,6 +47,7 @@ pi install ~/workspace/development/pi-mailbox
 |---|---|
 | `/mail`, `alt+m`, `ctrl+shift+m` | 이 세션의 메일함 패널을 열거나 닫습니다. 보기만 하며 처리로 기록하지 않습니다. |
 | `/mail board [on\|off\|reset]` | 패널을 켜거나 끕니다. `reset`은 패널을 editor 위의 원래 자리로 되돌립니다. |
+| `/mail why` | 대기 중인 메일이 지금 처리되는지, 처리되지 않는다면 어떤 조건 때문인지 보여 줍니다. 보기만 하며 처리로 기록하지 않습니다. |
 | `/mail agents` | 메일을 보낼 수 있는 pi 세션을 보여 줍니다. |
 | `/mail send <대상> [--fyi] <내용>` | 사용자로서 메일을 보냅니다. |
 | `/mail reply <ID> <내용>` | 받은 메일에 답장합니다. |

@@ -127,6 +127,8 @@ export class PiMailbox {
   /** Side panel overlay options, shared with pi-tui, which reads the drag offsets on every render. */
   private boardOptions?: OverlayOptions;
   private lastError?: string;
+  /** The most recent reason a wake was not attempted, and since when it has held. */
+  private lastSkip?: { reason: string; since: number };
   private board?: { close: () => void; rerender: () => void };
 
   private call: Call;
@@ -429,25 +431,69 @@ export class PiMailbox {
     return true;
   }
 
-  private async ordinary(ctx: ExtensionContext, registration: Registration, state: Inspection): Promise<void> {
-    if (!this.idle(ctx)) { if (!this.running) this.schedule(ctx, 1000); return; }
-    if (this.pending.size || !state.has_action || state.role === null) return;
-    if (!this.quiet(ctx, state.thresholds, state.skip_input_quiet)) {
-      this.schedule(ctx, Math.max(1000, this.lastKey + state.thresholds.idle_minutes * 60000 - Date.now()));
-      return;
+  /**
+   * Why an idle-time wake cannot happen right now, in the order the wake path checks.
+   * Each blocker carries the recheck it needs; an empty list means a wake claim may be tried.
+   * `/mail why` shows the same list, so the explanation never drifts from the behaviour.
+   */
+  wakeBlockers(ctx: ExtensionContext, state: Inspection): { text: string; retry?: () => void }[] {
+    const blockers: { text: string; retry?: () => void }[] = [];
+    if (!this.idle(ctx)) {
+      const idleNow = ctx.isIdle();
+      if (this.running) blockers.push({ text: idleNow
+        ? "pi is idle, but the receiver still thinks a turn is running (agent_settled never arrived)"
+        : "a turn is running" });
+      if (this.blocked) blockers.push({ text: `an extension dialog is open (${this.blocked})`, retry: () => this.schedule(ctx, 1000) });
+      if (this.preparing) blockers.push({ text: "a user prompt is being prepared", retry: () => this.schedule(ctx, 1000) });
+      if (!idleNow && !this.running) blockers.push({ text: "pi is busy", retry: () => this.schedule(ctx, 1000) });
+      if (ctx.hasPendingMessages()) blockers.push({ text: "pi has queued messages waiting to run", retry: () => this.schedule(ctx, 1000) });
+      return blockers;
     }
-    if (!Object.hasOwn(WAKE_READY_STATES, state.turn_state)) { this.refreshNeeded = true; this.schedule(ctx, 1000); return; }
-    if (state.wake_count >= state.thresholds.wakes_per_hour) { this.schedule(ctx, 300000); return; }
-    if (state.coalesce_until * 1000 > Date.now()) { this.schedule(ctx, state.coalesce_until * 1000 - Date.now()); return; }
+    if (this.pending.size) {
+      const phases = [...this.pending.values()].map(pending => pending.phase).join(", ");
+      return [{ text: `a claimed bundle is not resolved yet (${phases}); /mail recover settles an uncertain one` }];
+    }
+    if (!state.has_action) return [{ text: state.queued_total
+      ? "only FYI mail is queued; it waits for its batching delay or the next prompt"
+      : "nothing is queued" }];
+    if (state.role === null) return [{ text: "this session has no HAM role in this repository (mode off or not a member)" }];
+    const thresholds = state.thresholds;
+    const quietFor = Date.now() - this.lastKey, needed = thresholds.idle_minutes * 60000;
+    if (!this.editorEmpty(ctx)) blockers.push({ text: "the editor has a draft",
+      retry: () => this.schedule(ctx, Math.max(1000, this.lastKey + needed - Date.now())) });
+    if (!state.skip_input_quiet && quietFor < needed) blockers.push({
+      text: `terminal input ${Math.round(quietFor / 1000)}s ago; waits for ${thresholds.idle_minutes} min without input`,
+      retry: () => this.schedule(ctx, Math.max(1000, this.lastKey + needed - Date.now())) });
+    if (blockers.length) return blockers;
+    if (!Object.hasOwn(WAKE_READY_STATES, state.turn_state))
+      return [{ text: `HAM reports turn state '${state.turn_state}', not idle/done (Herdr's view of this pane)`,
+        retry: () => { this.refreshNeeded = true; this.schedule(ctx, 1000); } }];
+    if (state.wake_count >= thresholds.wakes_per_hour)
+      return [{ text: `hourly wake limit reached (${state.wake_count}/${thresholds.wakes_per_hour})`, retry: () => this.schedule(ctx, 300000) }];
+    const coalesce = state.coalesce_until * 1000 - Date.now();
+    if (coalesce > 0) return [{ text: `collecting mail for ${Math.ceil(coalesce / 1000)}s more`, retry: () => this.schedule(ctx, coalesce) }];
+    return [];
+  }
+
+  private skip(reason: string | undefined): void {
+    if (reason === undefined) this.lastSkip = undefined;
+    else if (this.lastSkip?.reason !== reason) this.lastSkip = { reason, since: Date.now() };
+  }
+
+  private async ordinary(ctx: ExtensionContext, registration: Registration, state: Inspection): Promise<void> {
+    const [blocker] = this.wakeBlockers(ctx, state);
+    if (blocker) { this.skip(blocker.text); blocker.retry?.(); return; }
     const serial = this.inputSerial;
     const claim = await this.receiver("claim", { ...identity(registration.agent), wake: true }, ctx);
-    if (claim.claim_id === null) return;
+    if (claim.claim_id === null) { this.skip(`${this.label} declined the wake claim: ${claim.reason}`); return; }
     const pending = this.track(claim, "prepared");
     // No await may separate this final idle/editor/session check and sendMessage.
     if (!this.current(ctx) || serial !== this.inputSerial || !this.idle(ctx) || !this.quiet(ctx, state.thresholds, claim.skip_input_quiet)) {
+      this.skip("input or session changed while claiming; retrying");
       await this.release(pending, "not_applied", "wake never submitted after final user/idle/session gate changed", ctx);
       return;
     }
+    this.skip(undefined);
     if (!this.inject(pending, "turn")) await this.release(pending, "unknown", "sendMessage acceptance uncertain", ctx);
     this.render(ctx);
   }
@@ -512,6 +558,44 @@ export class PiMailbox {
     if (!this.belongs(ctx)) return;
     if (this.pending.size) void this.confirm(ctx);
     this.schedule(ctx, 500);
+  }
+
+  // ---- diagnostics ---------------------------------------------------------------------------
+  /** `/mail why`: what the receiver sees right now and why it is (not) processing mail. View-only. */
+  async explain(ctx: ExtensionContext): Promise<string> {
+    const ago = (ms: number) => ms < 60000 ? `${Math.round(ms / 1000)}s` : ms < 3600000 ? `${Math.round(ms / 60000)}m` : `${(ms / 3600000).toFixed(1)}h`;
+    const lines = [`${this.label} receiver (${this.backend.name} backend)`];
+    if (!this.eligible(ctx)) return lines.concat("Not receiving: only the root interactive pi session receives mail" +
+      (this.backend.name === "ham" ? " inside Herdr" : "") + ".").join("\n");
+    if (this.stopped || !this.belongs(ctx)) return lines.concat("Not receiving: the receiver has not started for this session.").join("\n");
+    const registration = await this.register(ctx);
+    if (!registration || !this.current(ctx))
+      return lines.concat(`Not registered: ${this.lastError ?? "registration has not completed"}`).join("\n");
+    let state: Inspection | undefined;
+    try { state = await this.receiver("inspect", identity(registration.agent), ctx); this.state = state; this.render(ctx); }
+    catch (error) { return lines.concat(`Inspect failed: ${diagnosticText(String(error), 400)}`).join("\n"); }
+    const agent = registration.agent;
+    lines[0] += ` · ${agent.alias ?? agent.agent_id.slice(0, 8)} (generation ${agent.generation}${state.role ? `, ${state.role}` : ""})`;
+    const actions = state.inbox.filter(item => item.kind === "action").length;
+    lines.push(`Queue: ${state.queued_total} queued (${actions} action, ${state.urgent.length} urgent)` +
+      ` · turn state ${state.turn_state} · wakes ${state.wake_count}/${state.thresholds.wakes_per_hour} this hour`);
+    lines.push(`Session: pi ${ctx.isIdle() ? "idle" : "busy"} · turn running ${this.running ? "yes" : "no"} · dialogs ${this.blocked}` +
+      ` · preparing ${this.preparing} · pi queue ${ctx.hasPendingMessages() ? "not empty" : "empty"}`);
+    lines.push(`Input: editor ${this.editorEmpty(ctx) ? "empty" : "has a draft"} · last input ${ago(Date.now() - this.lastKey)} ago` +
+      ` (needs ${state.thresholds.idle_minutes}m)`);
+    if (this.pending.size) lines.push(`Claims in flight: ${[...this.pending.values()].map(item => `${item.claim_id.slice(0, 8)} ${item.phase}`).join(", ")}`);
+    if (this.errors.size && this.lastError) lines.push(`Receiver error: ${this.lastError}`);
+    if (state.urgent.length) lines.push(this.running || !ctx.isIdle()
+      ? "Urgent: cancels for the running thread abort it; amends steer in when the editor is empty; others wait for idle."
+      : "Urgent: processed first once the editor is empty (a cancel also over a draft).");
+    const blockers = state.queued_total ? this.wakeBlockers(ctx, state) : [];
+    if (!state.queued_total) lines.push("Now: nothing is waiting.");
+    else if (!blockers.length) lines.push("Now: ready; the next check claims and delivers the mail.");
+    else lines.push(...blockers.map((blocker, index) => `${index ? "     " : "Now: "}waiting — ${blocker.text}`));
+    if (this.lastSkip && state.queued_total)
+      lines.push(`Last skipped: ${this.lastSkip.reason} (for ${ago(Date.now() - this.lastSkip.since)})`);
+    this.schedule(ctx, 0);
+    return lines.join("\n");
   }
 
   // ---- view-only mailbox board ---------------------------------------------------------------

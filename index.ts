@@ -53,6 +53,7 @@ function line(message: StoredMessage): string {
 const USAGE = [
   "/mail, alt+m, ctrl+shift+m    toggle this session's mailbox panel (view only; drag its title to move)",
   "/mail board [on|off|reset]    show, hide, or move the panel back above the editor",
+  "/mail why                     why queued mail is or is not being processed right now",
   "/mail agents                  list pi sessions you can address",
   "/mail send <to> [--fyi] <text>  queue mail for another pi session (as the user)",
   "/mail reply <id> <text>       reply to a message (as the user)",
@@ -113,6 +114,7 @@ export default async function piMailbox(pi: ExtensionAPI): Promise<void> {
       return mailbox.showMailbox(ctx, action);
     }
     if (verb === "help") return notify(USAGE);
+    if (verb === "why") return notify(await mailbox.explain(ctx));
     if (kind === "ham")
       return notify("HAM mode: send/amend/cancel as the user from the HAM Mailbox (Threads: Enter reply, u amend, c cancel). " +
         "Agents use the HAM skill CLI.", "warning");

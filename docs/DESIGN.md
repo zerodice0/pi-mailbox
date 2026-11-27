@@ -41,6 +41,13 @@ pi-subagents의 자식 프로세스(`PI_SUBAGENT_CHILD`)에서는 아무것도 �
 - **긴급 claim:** turn state, coalesce, 시간당 횟수는 건너뛰고 hop 제한은 지킵니다. 원본이 아직 대기 중이면 원본도 함께 claim합니다.
 - **ACK:** 세션 기록에서 `ham_mailbox` custom message의 marker, details, sha256이 정확히 일치하는 항목을 찾았을 때만 `applied`를 보고합니다. idle 상태가 되었는데도 기록에 없고 pi 큐에도 없으면, 3초가 지난 뒤 `not_applied`로 되돌립니다. 그 밖의 불확실한 경우는 `unknown`으로 남기고, 다시 주입하지 않습니다.
 
+## 4-2. 진단(`/mail why`)
+
+- 자동 처리 경로가 확인하는 조건을 `wakeBlockers()` 하나로 모았습니다. 자동 처리와 `/mail why`가 같은 목록을 쓰므로 설명과 실제 동작이 어긋나지 않습니다.
+- 확인 순서는 세션 상태(턴 실행, 확장 대화상자, 프롬프트 준비, pi 대기열), 처리 중인 묶음, 깨울 메일 유무, HAM 역할, editor 초안과 입력 정지, HAM이 보고한 turn 상태, 시간당 횟수, 묶음 대기입니다.
+- pi는 idle인데 수신기의 "턴 실행 중" 표시가 남아 있으면 따로 알립니다(`agent_settled`를 놓친 경우).
+- 마지막으로 자동 처리를 건너뛴 이유와 그 이유가 유지된 시간을 메모리에 둡니다. `/mail why`는 `inspect`만 호출하며 claim이나 ACK를 하지 않습니다.
+
 ## 4-1. 메일함 패널과 메일 카드
 
 - **패널:** `/mail`, `alt+m`, `ctrl+shift+m`으로 열고 닫습니다(`/mail board on|off|reset`).

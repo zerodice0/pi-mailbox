@@ -277,3 +277,40 @@ test("status text, journal matching and reply parsing", () => {
   expect(parsed.inbox).toEqual([]);
   expect(() => parseReply("inspect", { ...inspection(), urgent: [{ ...urgent("amend"), urgency: "steer" }] })).toThrow();
 });
+
+test("/mail why explains each blocked wake gate, including a turn flag that never settled", async () => {
+  const harness = new Harness();
+  await harness.start();
+  harness.state = inspection({ has_action: true, queued_total: 1, turn_state: "working",
+    inbox: [{ message_id: "m1", thread_id: THREAD_A, kind: "action", urgency: null, target_message_id: null, sender: "h/a",
+      subject: "", preview: "do it", state: "queued", created_at: 0 }] });
+  let text = await harness.mailbox.explain(harness.context);
+  expect(text).toContain("Queue: 1 queued (1 action, 0 urgent) · turn state working");
+  expect(text).toContain("Now: waiting — HAM reports turn state 'working'");
+
+  harness.state = { ...harness.state, turn_state: "idle" };
+  harness.editor = "draft";
+  text = await harness.mailbox.explain(harness.context);
+  expect(text).toContain("waiting — the editor has a draft");
+  harness.editor = "";
+
+  // pi went idle but agent_settled never reached the receiver.
+  harness.mailbox.agentStart(harness.context);
+  text = await harness.mailbox.explain(harness.context);
+  expect(text).toContain("receiver still thinks a turn is running");
+  await harness.kick();
+  expect(harness.claimCalls()).toEqual([]);
+  expect(await harness.mailbox.explain(harness.context)).toMatch(/Last skipped: pi is idle, but the receiver still thinks a turn is running \(agent_settled never arrived\) \(for \d+s\)/);
+
+  harness.mailbox.settled(harness.context);
+  expect(await harness.mailbox.explain(harness.context)).toContain("Now: ready; the next check claims and delivers the mail.");
+});
+
+test("/mail why reports an empty queue and a declined claim", async () => {
+  const harness = new Harness();
+  await harness.start();
+  expect(await harness.mailbox.explain(harness.context)).toContain("Now: nothing is waiting.");
+  harness.state = inspection({ has_action: true, queued_total: 1 });
+  await harness.kick();  // no claim bundle queued in the harness: the backend declines
+  expect(await harness.mailbox.explain(harness.context)).toContain("Last skipped: HAM declined the wake claim: empty");
+});
