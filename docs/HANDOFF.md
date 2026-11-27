@@ -20,9 +20,12 @@
 | macbook-pro | `e408c47`(`git pull`, 테스트 통과) | `194be93`(`ham rollout`) | v9 |
 | winmini | `e408c47`(`git pull`, 테스트 통과) | `194be93`(로컬 체크아웃) | v9 |
 | rogallyx | `e408c47`(관리 체크아웃) | `194be93`(로컬 체크아웃) | v9 |
+| EdgeDX_Cloud_Development_Server (`sjum-u22`) | `fd52f46` | `194be93`(GitHub 설치, macbook-pro에서 `ham rollout`, 2026-11-27) | 미확인 |
+| EdgeDX_AI_Bridge_Development_Server (`EDX-DEV2`) | `fd52f46` | `194be93`(GitHub 설치, macbook-pro에서 `ham rollout`, 2026-11-27) | 미확인 |
 | winmax2 | 미설치(오프라인) | 미갱신 | 미확인 |
 
 - pi-mailbox 표의 commit은 각 호스트 체크아웃의 `HEAD`입니다. 관리 체크아웃에서 push한 뒤 다른 호스트에서 `git pull --ff-only`로 맞춥니다.
+- EdgeDX 개발 서버 두 대는 macbook-pro의 HAM peer입니다(SSH 별칭은 macbook-pro 기준). 관리 체크아웃에서는 macbook-pro를 거쳐 접속합니다. HAM을 갱신할 때 이 두 서버도 함께 갱신해야 합니다. 갱신 전에는 HAM이 `a53a293`(schema 12)이라 pi-mailbox 등록이 `unsupported_client`로 계속 실패했습니다. 갱신 전 ledger 백업은 각 서버의 `ledger.pre-194be93.sqlite3`에 있습니다.
 - 모든 갱신 호스트의 HAM ledger는 schema 13입니다. HAM skill 사본도 갱신했습니다.
 - GitHub 설치는 갱신할 때마다 plugin root 경로가 바뀝니다. 그래서 rogallyx와 winmini의 peer 등록(`ledger peer add --ssh-alias s-mac-studio|macbook-pro`)을 다시 했습니다. HAM을 다시 갱신할 때도 같은 작업이 필요합니다.
 - 실행 중이던 pi 세션은 `/reload`를 실행하거나 다시 시작해야 확장이 적용됩니다. 사용자가 고른 세션만 다시 시작합니다.
