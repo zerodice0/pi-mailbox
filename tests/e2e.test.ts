@@ -38,7 +38,7 @@ class Session {
       isIdle: () => this.idle, hasPendingMessages: () => false, abort: () => { this.aborts++; },
       ui: { setStatus: () => undefined, notify: () => undefined, getEditorText: () => this.editor, onTerminalInput: () => () => undefined },
     } as unknown as ExtensionContext;
-    this.mailbox = new PiMailbox(pi, backend, {}, timers);
+    this.mailbox = new PiMailbox(pi, backend, { PI_MAILBOX_DIR: root }, timers);
   }
   async kick() { await this.mailbox.kick(this.context); }
   get sender() { return { kind: "agent" as const, agent_id: this.id }; }

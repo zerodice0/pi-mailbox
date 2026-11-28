@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PiMailbox, STALE_TURN_MS, acceptedEntry, isTyping, statusText, type Timers } from "../src/core.ts";
+import { PiMailbox, STALE_TURN_MS, TRACE_HEARTBEAT_MS, acceptedEntry, isTyping, statusText, type Timers } from "../src/core.ts";
+import { TRACE_LIMIT, Trace, inputKind } from "../src/trace.ts";
 import { parseReply } from "../src/ham.ts";
 import type { Call, ClaimBundle, Inspection, NativeMessage, UrgentItem } from "../src/types.ts";
 
@@ -46,9 +47,14 @@ class Harness {
   calls: { operation: string; data: Record<string, unknown> }[] = [];
   state = inspection();
   claims: ClaimBundle[] = [];
-  environment: Record<string, string | undefined> = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "w1:p2" };
+  environment: Record<string, string | undefined> = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "w1:p2",
+    PI_MAILBOX_DIR: this.directory };
+  /** Delays of every setTimeout the receiver asked for, and the terminal input listener it installed. */
+  timeouts: number[] = [];
+  type: (data: string) => void = () => undefined;
   clock = 1_000_000;
-  timers: Timers = { setTimeout: () => ({}), clearTimeout: () => undefined, setInterval: () => ({}), clearInterval: () => undefined,
+  timers: Timers = { setTimeout: (_callback, delay) => { this.timeouts.push(delay); return {}; }, clearTimeout: () => undefined,
+    setInterval: () => ({}), clearInterval: () => undefined,
     now: () => this.clock };
   context: ExtensionContext;
   mailbox: PiMailbox;
@@ -64,7 +70,7 @@ class Harness {
       abort: () => { this.aborts++; },
       ui: { setStatus: (_key: string, text: string | undefined) => { this.statuses.push(text); },
         notify: (message: string) => { this.notes.push(message); }, getEditorText: () => this.editor,
-        onTerminalInput: () => () => undefined },
+        onTerminalInput: (listener: (data: string) => void) => { this.type = listener; return () => undefined; } },
     } as unknown as ExtensionContext;
     const pi = {
       sendMessage: (message: NativeMessage, options: unknown) => { this.sent.push({ message, options }); },
@@ -88,6 +94,12 @@ class Harness {
     this.entries.push({ type: "custom_message", id, customType: message.customType, content: message.content, details: message.details });
   }
   async start() { await this.mailbox.start(this.context); }
+  /** The harness never runs timers; this marks the pending one as fired so the next schedule is visible. */
+  fired() { Object.assign(this.mailbox, { timer: undefined, timerAt: Infinity }); this.timeouts.length = 0; }
+  trace() {
+    return readFileSync(path.join(this.directory, "trace", "pi-session.jsonl"), "utf8").trimEnd().split("\n")
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+  }
   async kick() { await this.mailbox.kick(this.context); }
   /** Deliver an ordinary bundle on thread A and let the agent start working on it. */
   async workingOn(thread = THREAD_A) {
@@ -407,4 +419,105 @@ test("a stale observation is retried instead of falling back", async () => {
   await harness.kick();
   expect(harness.sent.length).toBe(0);
   expect(await harness.mailbox.explain(harness.context)).toContain("Last skipped: HAM declined the wake claim: observed_stale");
+});
+
+test("the trace records why mail waited, how long, and how it was finally delivered", async () => {
+  const harness = new Harness();
+  await harness.start();
+  await harness.kick();                                   // nothing queued: nothing worth recording
+  expect(harness.trace().map(line => line.event)).toEqual(["start", "registered"]);
+
+  harness.state = inspection({ has_action: true, queued_total: 1 });
+  harness.editor = "half-written prompt";
+  await harness.kick();
+  await harness.kick();                                   // same reason: not repeated
+  let lines = harness.trace();
+  expect(lines.at(-1)).toMatchObject({ event: "wait", key: "draft", queued: 1, editor: 19, pi_idle: true });
+  expect(lines.filter(line => line.event === "wait").length).toBe(1);
+  expect(JSON.stringify(lines)).not.toContain("half-written");
+
+  harness.type("x"); harness.type("\x1b[A");
+  harness.clock += TRACE_HEARTBEAT_MS;
+  await harness.kick();                                   // still waiting ten minutes later
+  expect(harness.trace().at(-1)).toMatchObject({ event: "still", key: "draft", inputs: 2, last_input: "\\u001b[A" });
+
+  // The user finally submits a prompt and the mail rides along.
+  harness.claims.push({ ...bundle([THREAD_A]), via: "before_agent_start" });
+  harness.mailbox.input(harness.context);
+  const natural = await harness.mailbox.natural({ prompt: "go" }, harness.context);
+  expect(natural?.message.customType).toBe("ham_mailbox");
+  harness.journal(natural!.message);
+  harness.editor = "";
+  harness.state = inspection();
+  await harness.kick();
+  lines = harness.trace();
+  expect(lines.slice(-4).map(line => [line.event, line.as ?? line.via ?? ""])).toEqual(
+    [["claimed", "before_agent_start"], ["sent", "prompt"], ["applied", ""], ["empty", ""]]);
+  const text = await harness.mailbox.explain(harness.context);
+  expect(text).toContain("Trace: " + path.join(harness.directory, "trace", "pi-session.jsonl"));
+  expect(text).toMatch(/\d\d:\d\d:\d\d wait draft/);
+});
+
+test("the trace records wake deliveries, declined claims and self-recoveries", async () => {
+  const harness = new Harness();
+  await harness.start();
+  harness.state = inspection({ has_action: true, queued_total: 1 });
+  await harness.kick();                                   // backend declines: no claim bundle queued
+  await harness.kick();
+  expect(harness.trace().filter(line => line.key === "declined:empty").length).toBe(1);
+  harness.claims.push({ ...bundle([THREAD_A]), via: "wake" });
+  await harness.kick();
+  expect(harness.trace().slice(-2)).toMatchObject([{ event: "claimed", via: "wake", messages: 1 }, { event: "sent", as: "turn" }]);
+
+  harness.mailbox.prompt(true, harness.context, "select");
+  harness.mailbox.input(harness.context);
+  expect(harness.trace().at(-1)).toMatchObject({ event: "recovered", what: "dialog count (the editor submitted a prompt)" });
+});
+
+test("typing does not probe the backend unless urgent mail is waiting behind the editor", async () => {
+  const harness = new Harness();
+  await harness.start();
+  await harness.kick();
+  harness.fired();
+  const calls = harness.calls.length;
+  for (const key of "hello") harness.type(key);
+  expect(harness.timeouts).toEqual([]);                   // no timer, so no inspect per keystroke
+  expect(harness.calls.length).toBe(calls);
+
+  // Ordinary mail arrives while the user types: the bell-driven check sets one timer for the quiet deadline.
+  harness.state = inspection({ has_action: true, queued_total: 1, thresholds: { ...harness.state.thresholds, idle_minutes: 3 } });
+  await harness.kick();
+  expect(harness.timeouts.length).toBe(1);
+  expect(harness.timeouts[0]).toBeGreaterThan(170000);
+  harness.fired();
+  harness.type("a");
+  expect(harness.timeouts).toEqual([]);
+
+  // An amend held behind a draft is rechecked as the editor changes.
+  harness.state = { ...harness.state, urgent: [urgent("amend")] };
+  await harness.kick();
+  harness.fired();
+  harness.type("\x7f");
+  expect(harness.timeouts).toEqual([1000]);
+});
+
+test("trace files stay bounded and never keep what was typed", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "pi-mailbox-trace-"));
+  directories.push(directory);
+  const trace = new Trace(directory, "/s/one.jsonl", () => 0);
+  for (let index = 0; index < 4000; index++) trace.write("wait", { key: "draft", text: "x".repeat(80), index });
+  const text = readFileSync(trace.file, "utf8");
+  expect(text.length).toBeLessThanOrEqual(TRACE_LIMIT);
+  expect(text.length).toBeGreaterThan(TRACE_LIMIT / 2 - 200);
+  expect(trace.tail(2).map(line => line.index)).toEqual([3998, 3999]);
+  expect(JSON.parse(text.slice(0, text.indexOf("\n"))).event).toBe("wait");   // cut at a line boundary
+
+  // Old sessions' files are removed when a receiver starts.
+  writeFileSync(path.join(directory, "trace", "old.jsonl"), "{}\n");
+  new Trace(directory, "/s/two.jsonl", () => Date.now() + 15 * 86400000);
+  expect(() => readFileSync(path.join(directory, "trace", "old.jsonl"))).toThrow();
+
+  expect([inputKind("a"), inputKind("한"), inputKind("\r"), inputKind("pasted text"), inputKind("\x1b[200~secret\x1b[201~"),
+    inputKind("\x1b[97;5u"), inputKind("\x1b[3~"), inputKind("\x1b[A"), inputKind("\x1b[?2026;2$y"), inputKind("\x1bx")])
+    .toEqual(["text", "text", "control", "text", "paste", "csi-u", "csi-~", "\\u001b[A", "\\u001b[?2026;2$y", "escape(2)"]);
 });

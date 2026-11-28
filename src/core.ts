@@ -22,12 +22,15 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MailboxBoard, boardOptions, loadPosition, savePosition, type BoardSnapshot } from "./board.ts";
 import { defaultRoot } from "./local.ts";
+import { Trace, inputKind } from "./trace.ts";
 import type { OverlayOptions } from "@earendil-works/pi-tui";
 import { ReceiverError, type Call, type ClaimBundle, type Inspection, type NativeAgent, type NativeClaim,
   type NativeMessage, type Operation, type ReceiverReplies, type Registration, type Request, type Thresholds,
   type Urgency } from "./types.ts";
 
 type Phase = "prepared" | "sent" | "unknown";
+/** One reason a wake cannot happen now; `key` is the stable name the trace groups by. */
+export interface Blocker { key: string; text: string; retry?: () => void }
 type Pending = NativeClaim & { phase: Phase; preparation?: string; message?: NativeMessage; threads: string[]; sentAt?: number };
 
 const WAKE_READY_STATES: Record<string, true> = { idle: true, done: true };
@@ -91,6 +94,8 @@ export const STALE_TURN_MS = 60000;
  * position and device attribute replies, kitty keyboard flag replies, OSC and DCS replies.
  */
 const NOT_TYPING = /^(?:\x1b\[[IO]|\x1b\[<[\d;]*[Mm]|\x1b\[M[\s\S]{3}|\x1b\[\d+;\d+R|\x1b\[[?>][\d;]*c|\x1b\[\?\d*u|\x1b\][\s\S]*(?:\x07|\x1b\\)|\x1bP[\s\S]*\x1b\\)+$/;
+/** While mail keeps waiting for the same reason, the trace repeats that reason this often. */
+export const TRACE_HEARTBEAT_MS = 600000;
 export const isTyping = (data: string): boolean => data.length > 0 && !NOT_TYPING.test(data);
 const unref = <T>(timer: T): T => {
   (timer as { unref?: () => void } | undefined)?.unref?.();
@@ -149,6 +154,14 @@ export class PiMailbox {
   private lastError?: string;
   /** The most recent reason a wake was not attempted, and since when it has held. */
   private lastSkip?: { reason: string; since: number };
+  /** Durable record of waits and deliveries; see trace.ts. */
+  private trace?: Trace;
+  private traceKey?: string;
+  private traceAt = 0;
+  /** Typing events since the last trace line, and the kind of the latest one. */
+  private inputs = 0;
+  private lastInput = "";
+  private registered?: string;
   /** idle_source of the last wake claim, when the backend reports it. */
   private idleSource?: string;
   private board?: { close: () => void; rerender: () => void };
@@ -184,6 +197,7 @@ export class PiMailbox {
     this.lastError = diagnosticText(textValue, 240);
     this.board?.rerender();
     if (previous === undefined || now - previous >= 600000) {
+      this.trace?.write("error", { phase, text: diagnosticText(textValue, 400) });
       ctx.ui.notify(diagnosticText(textValue, 1200), "warning");
       this.errors.set(key, now);
     }
@@ -225,9 +239,16 @@ export class PiMailbox {
     this.sessionRef = session;
     this.running = ctx.isIdle() === false;
     this.lastKey = Date.now();
+    this.trace = new Trace(defaultRoot(this.environment), session, () => this.now());
+    this.trace.write("start", { backend: this.backend.name });
     this.unsubscribe = ctx.ui.onTerminalInput(data => {
       // Only typing and paste reset the quiet time; mouse, focus and terminal replies do not.
-      if (isTyping(data)) { this.lastKey = Date.now(); this.inputSerial++; this.schedule(this.ctx ?? ctx, 1000); }
+      if (!isTyping(data)) return undefined;
+      this.lastKey = Date.now(); this.inputSerial++;
+      this.inputs++; this.lastInput = inputKind(data);
+      // Typing never reveals new mail: the bell does, and waiting mail already has a timer for the
+      // moment its gates can pass. Only urgent mail held behind a draft needs a recheck as the editor changes.
+      if (this.state?.urgent.length) this.schedule(this.ctx ?? ctx, 1000);
       return undefined;
     });
     this.safety = this.timers.setInterval(() => { this.refreshNeeded = true; void this.kick(this.ctx ?? ctx); }, 300000);
@@ -237,6 +258,7 @@ export class PiMailbox {
   async shutdown(ctx: ExtensionContext): Promise<void> {
     if (this.stopped) return;
     if (this.belongs(ctx)) await this.confirm(ctx);
+    this.trace?.write("stop", { unresolved: this.pending.size });
     this.stopped = true;
     this.watcher?.close(); this.watcher = undefined;
     this.unsubscribe?.(); this.unsubscribe = undefined;
@@ -261,6 +283,12 @@ export class PiMailbox {
         if (!this.belongs(ctx)) return undefined;
         this.registration = result; this.refreshNeeded = false; this.registrationFailures = 0;
         this.state = result;
+        const identityKey = `${result.agent.agent_id}:${result.agent.generation}:${result.agent.alias ?? ""}:${result.role}`;
+        if (identityKey !== this.registered) {
+          this.registered = identityKey;
+          this.trace?.write("registered", { agent: result.agent.alias ?? result.agent.agent_id.slice(0, 8),
+            generation: result.agent.generation, role: result.role, capabilities: result.capabilities ?? [] });
+        }
         for (const claim of result.pending_claims) {
           if (!this.pending.has(claim.claim_id)) this.pending.set(claim.claim_id, { ...claim, phase: "unknown", threads: [] });
         }
@@ -293,6 +321,7 @@ export class PiMailbox {
   // ---- claim bookkeeping -------------------------------------------------------------------
   private async release(pending: Pending, disposition: "unknown" | "not_applied", evidence: string, ctx: ExtensionContext): Promise<void> {
     pending.phase = "unknown";
+    this.trace?.write("released", { claim: pending.claim_id.slice(0, 8), disposition, evidence });
     try {
       await this.call("release", { claim_id: pending.claim_id, agent_id: pending.agent_id,
         generation: pending.generation, disposition, evidence });
@@ -312,6 +341,7 @@ export class PiMailbox {
             generation: pending.generation, session_ref: pending.session_ref, marker: pending.marker,
             content_sha256: pending.content_sha256, entry_id: entry }, ctx);
           this.pending.delete(pending.claim_id);
+          this.trace?.write("applied", { claim: pending.claim_id.slice(0, 8) });
         } catch (error) { this.report(ctx, error, "applied"); }
       }
     } finally { this.acknowledging = false; this.render(ctx); }
@@ -323,6 +353,8 @@ export class PiMailbox {
       phase, preparation, message: claim.message, threads };
     this.pending.set(claim.claim_id, pending);
     for (const thread of threads) this.activeThreads.add(thread);
+    this.trace?.write("claimed", { claim: claim.claim_id.slice(0, 8), via: claim.via, messages: claim.messages.length,
+      urgent: claim.messages.filter(message => message.urgency).length || undefined, idle_source: claim.idle_source });
     return pending;
   }
   /**
@@ -332,6 +364,7 @@ export class PiMailbox {
    */
   private inject(pending: Pending, mode: "steer" | "turn"): boolean {
     pending.phase = "sent"; pending.sentAt = Date.now();
+    this.trace?.write("sent", { claim: pending.claim_id.slice(0, 8), as: mode });
     try {
       this.pi.sendMessage(pending.message!, mode === "steer"
         ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "followUp", triggerTurn: true });
@@ -459,48 +492,70 @@ export class PiMailbox {
    * Each blocker carries the recheck it needs; an empty list means a wake claim may be tried.
    * `/mail why` shows the same list, so the explanation never drifts from the behaviour.
    */
-  wakeBlockers(ctx: ExtensionContext, state: Inspection): { text: string; retry?: () => void }[] {
-    const blockers: { text: string; retry?: () => void }[] = [];
+  wakeBlockers(ctx: ExtensionContext, state: Inspection): Blocker[] {
+    const blockers: Blocker[] = [];
     if (!this.idle(ctx)) {
       const idleNow = ctx.isIdle();
       if (this.running) blockers.push(idleNow && !ctx.hasPendingMessages()
-        ? { text: "pi is idle, but the receiver still thinks a turn is running (agent_settled never arrived);" +
+        ? { key: "stale-turn", text: "pi is idle, but the receiver still thinks a turn is running (agent_settled never arrived);" +
             ` it is dropped after ${STALE_TURN_MS / 1000}s`, retry: () => this.schedule(ctx, 5000) }
-        : { text: "a turn is running" });
-      if (this.blocked) blockers.push({ text: `an extension dialog is open (${this.blocked})`, retry: () => this.schedule(ctx, 1000) });
-      if (this.preparing) blockers.push({ text: "a user prompt is being prepared", retry: () => this.schedule(ctx, 1000) });
-      if (!idleNow && !this.running) blockers.push({ text: "pi is busy", retry: () => this.schedule(ctx, 1000) });
-      if (ctx.hasPendingMessages()) blockers.push({ text: "pi has queued messages waiting to run", retry: () => this.schedule(ctx, 1000) });
+        : { key: "turn", text: "a turn is running" });
+      if (this.blocked) blockers.push({ key: "dialog", text: `an extension dialog is open (${this.blocked})`, retry: () => this.schedule(ctx, 1000) });
+      if (this.preparing) blockers.push({ key: "preparing", text: "a user prompt is being prepared", retry: () => this.schedule(ctx, 1000) });
+      if (!idleNow && !this.running) blockers.push({ key: "busy", text: "pi is busy", retry: () => this.schedule(ctx, 1000) });
+      if (ctx.hasPendingMessages()) blockers.push({ key: "pi-queue", text: "pi has queued messages waiting to run", retry: () => this.schedule(ctx, 1000) });
       return blockers;
     }
     if (this.pending.size) {
       const phases = [...this.pending.values()].map(pending => pending.phase).join(", ");
-      return [{ text: `a claimed bundle is not resolved yet (${phases}); /mail recover settles an uncertain one` }];
+      return [{ key: "claim-pending", text: `a claimed bundle is not resolved yet (${phases}); /mail recover settles an uncertain one` }];
     }
-    if (!state.has_action) return [{ text: state.queued_total
-      ? "only FYI mail is queued; it waits for its batching delay or the next prompt"
-      : "nothing is queued" }];
-    if (state.role === null) return [{ text: "this session has no HAM role in this repository (mode off or not a member)" }];
+    if (!state.has_action) return [state.queued_total
+      ? { key: "fyi-only", text: "only FYI mail is queued; it waits for its batching delay or the next prompt" }
+      : { key: "empty", text: "nothing is queued" }];
+    if (state.role === null) return [{ key: "no-role", text: "this session has no HAM role in this repository (mode off or not a member)" }];
     const thresholds = state.thresholds;
     const quietFor = Date.now() - this.lastKey, needed = thresholds.idle_minutes * 60000;
-    if (!this.editorEmpty(ctx)) blockers.push({ text: "the editor has a draft",
+    if (!this.editorEmpty(ctx)) blockers.push({ key: "draft", text: "the editor has a draft",
       retry: () => this.schedule(ctx, Math.max(1000, this.lastKey + needed - Date.now())) });
     if (!state.skip_input_quiet && quietFor < needed) blockers.push({
-      text: `terminal input ${Math.round(quietFor / 1000)}s ago; waits for ${thresholds.idle_minutes} min without input`,
+      key: "input-quiet", text: `terminal input ${Math.round(quietFor / 1000)}s ago; waits for ${thresholds.idle_minutes} min without input`,
       retry: () => this.schedule(ctx, Math.max(1000, this.lastKey + needed - Date.now())) });
     if (blockers.length) return blockers;
     if (!observesIdle(state) && !Object.hasOwn(WAKE_READY_STATES, state.turn_state))
-      return [{ text: `HAM reports turn state '${state.turn_state}', not idle/done (Herdr's view of this pane)`,
+      return [{ key: "turn-state", text: `HAM reports turn state '${state.turn_state}', not idle/done (Herdr's view of this pane)`,
         retry: () => { this.refreshNeeded = true; this.schedule(ctx, 1000); } }];
     if (state.wake_count >= thresholds.wakes_per_hour)
-      return [{ text: `hourly wake limit reached (${state.wake_count}/${thresholds.wakes_per_hour})`, retry: () => this.schedule(ctx, 300000) }];
+      return [{ key: "hourly-limit", text: `hourly wake limit reached (${state.wake_count}/${thresholds.wakes_per_hour})`, retry: () => this.schedule(ctx, 300000) }];
     const coalesce = state.coalesce_until * 1000 - Date.now();
-    if (coalesce > 0) return [{ text: `collecting mail for ${Math.ceil(coalesce / 1000)}s more`, retry: () => this.schedule(ctx, coalesce) }];
+    if (coalesce > 0) return [{ key: "coalesce", text: `collecting mail for ${Math.ceil(coalesce / 1000)}s more`, retry: () => this.schedule(ctx, coalesce) }];
     return [];
   }
 
   private now(): number { return this.timers.now?.() ?? Date.now(); }
-  private recovered(what: string): void { this.lastRecovery = { what, at: this.now() }; }
+  private recovered(what: string): void {
+    this.lastRecovery = { what, at: this.now() };
+    this.trace?.write("recovered", { what });
+  }
+  /** What the gates saw, for a trace line. Counts and lengths only, never the text itself. */
+  private conditions(ctx: ExtensionContext, state: Inspection): Record<string, unknown> {
+    let editor: number | undefined;
+    try { editor = ctx.ui.getEditorText().length; } catch { /* no editor in this mode */ }
+    return { queued: state.queued_total, urgent: state.urgent.length || undefined, turn_state: state.turn_state,
+      pi_idle: ctx.isIdle(), running: this.running || undefined, dialogs: this.blocked || undefined,
+      pi_queue: ctx.hasPendingMessages() || undefined, editor, quiet_s: Math.round((Date.now() - this.lastKey) / 1000),
+      inputs: this.inputs, last_input: this.lastInput || undefined };
+  }
+  /**
+   * Record why mail is waiting: once when the reason changes, then every TRACE_HEARTBEAT_MS while the
+   * same reason holds, so a long wait shows how long it lasted and whether input kept arriving.
+   */
+  private mark(ctx: ExtensionContext, state: Inspection, key: string, text: string, also: string[] = []): void {
+    const now = this.now(), same = key === this.traceKey;
+    if (same && now - this.traceAt < TRACE_HEARTBEAT_MS) return;
+    this.trace?.write(same ? "still" : "wait", { key, text, also: also.length ? also : undefined, ...this.conditions(ctx, state) });
+    this.traceKey = key; this.traceAt = now; this.inputs = 0;
+  }
   /** Drop a `running` flag that outlived the turn: pi has been idle with an empty queue for a while. */
   private recoverStaleTurn(ctx: ExtensionContext): void {
     if (!this.running || !ctx.isIdle() || ctx.hasPendingMessages()) { this.staleSince = undefined; return; }
@@ -518,7 +573,11 @@ export class PiMailbox {
   }
 
   private async ordinary(ctx: ExtensionContext, registration: Registration, state: Inspection): Promise<void> {
-    const [blocker] = this.wakeBlockers(ctx, state);
+    const [blocker, ...others] = this.wakeBlockers(ctx, state);
+    if (!state.queued_total && !state.urgent.length) {
+      if (this.traceKey !== undefined && this.traceKey !== "empty") this.trace?.write("empty");
+      this.traceKey = "empty";
+    } else if (blocker) this.mark(ctx, state, blocker.key, blocker.text, others.map(other => other.key));
     if (blocker) { this.skip(blocker.text); blocker.retry?.(); return; }
     const serial = this.inputSerial;
     // pi was idle at the gate above; the backend rejects an observation older than 60s.
@@ -526,10 +585,12 @@ export class PiMailbox {
     const claim = await this.receiver("claim", { ...identity(registration.agent), wake: true, ...observation }, ctx);
     if (claim.claim_id === null) {
       this.skip(`${this.label} declined the wake claim: ${claim.reason}`);
+      this.mark(ctx, state, "declined:" + claim.reason, `${this.label} declined the wake claim: ${claim.reason}`);
       if (claim.reason === "observed_stale") this.schedule(ctx, 1000);
       return;
     }
     this.idleSource = claim.idle_source;
+    this.traceKey = "claimed";
     const pending = this.track(claim, "prepared");
     // No await may separate this final idle/editor/session check and sendMessage.
     if (!this.current(ctx) || serial !== this.inputSerial || !this.idle(ctx) || !this.quiet(ctx, state.thresholds, claim.skip_input_quiet)) {
@@ -564,6 +625,8 @@ export class PiMailbox {
         await this.release(pending, "not_applied", "receiver did not return context after input/session changed", ctx);
         return undefined;
       }
+      this.traceKey = "claimed";
+      this.trace?.write("sent", { claim: claim.claim_id.slice(0, 8), as: "prompt" });
       return { message: claim.message };
     } catch (error) { this.report(ctx, error, "claim"); return undefined; }
     finally { this.preparing--; this.render(ctx); }
@@ -649,6 +712,14 @@ export class PiMailbox {
     if (this.lastRecovery) lines.push(`Recovered: dropped a stuck ${this.lastRecovery.what} ${ago(this.now() - this.lastRecovery.at)} ago`);
     if (this.lastSkip && state.queued_total)
       lines.push(`Last skipped: ${this.lastSkip.reason} (for ${ago(Date.now() - this.lastSkip.since)})`);
+    const recent = this.trace?.tail(8) ?? [];
+    if (recent.length) {
+      lines.push(`Trace: ${this.trace!.file}`);
+      for (const line of recent) {
+        const detail = [line.key, line.as, line.via, line.disposition, line.what, line.claim].filter(value => typeof value === "string").join(" ");
+        lines.push(`  ${new Date(line.at).toTimeString().slice(0, 8)} ${line.event}${detail ? " " + detail : ""}`);
+      }
+    }
     this.schedule(ctx, 0);
     return lines.join("\n");
   }
